@@ -227,11 +227,12 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
             batch = df.slice(batch_start, BS)
             
             # Resize images
-            images = [resize_and_crop(bytes_to_pil_image(img.as_py()), new_resolution) for img in batch[IMAGE_COLUMN_NAME]]
-            image_tensors = torch.stack([preprocess_image(img) for img in images]).to(rank)
+            images = [bytes_to_pil_image(img.as_py()) for img in batch[IMAGE_COLUMN_NAME]]
+            resized_images = [resize_and_crop(img, new_resolution) for img in images]
+            image_tensors = torch.stack([preprocess_image(img) for img in resized_images]).to(rank)
             
             # Generate captions
-            captions = generate_captions(moondream, moondream_tokenizer, image_tensors)
+            captions = generate_captions(moondream, moondream_tokenizer, images)
             
             # Generate VAE latents
             latents = generate_latents(vae, image_tensors)
