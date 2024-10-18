@@ -23,7 +23,7 @@ MODELS_DIR_BASE = "../../models"
 VAE_HF_NAME = "madebyollin/sdxl-vae-fp16-fix"
 SIGLIP_HF_NAME = "hf-hub:timm/ViT-SO400M-14-SigLIP-384"
 IMAGE_COLUMN_NAME = "jpg"
-IMAGE_ID_COLUMN_NAME = "image_id"
+IMAGE_ID_COLUMN_NAME = "key"
 BS = 64
 # Deletes original parquet files after processing
 DELETE_AFTER_PROCESSING = True
