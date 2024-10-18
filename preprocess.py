@@ -15,6 +15,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 from huggingface_hub import HfFileSystem, hf_hub_download
 import threading
+import io
 
 DATASET = "commoncatalog-cc-by"
 DATASET_DIR_BASE = "../../datasets"
@@ -102,6 +103,9 @@ class BucketManager:
         aspect = float(w)/float(h)
         bucket_id = np.abs(np.log(self.aspects) - np.log(aspect)).argmin()
         return self.resolutions[bucket_id]
+
+def bytes_to_pil_image(image_bytes):
+    return Image.open(io.BytesIO(image_bytes))
 
 def resize_and_crop(image, target_size):
     # image: PIL Image
@@ -212,10 +216,10 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
         df = pq.read_table(parquet_filepath)
         
         # Get ideal resolution
-        sample_image = Image.open(df[IMAGE_COLUMN_NAME][0].as_py())
+        sample_image_bytes = df[IMAGE_COLUMN_NAME][0].as_py()
+        sample_image = bytes_to_pil_image(sample_image_bytes)
         original_resolution = sample_image.size
         new_resolution = bucket_manager.get_ideal_resolution(original_resolution)
-        sample_image.close()
         
         new_rows = []
         
@@ -223,7 +227,7 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
             batch = df.slice(batch_start, BS)
             
             # Resize images
-            images = [resize_and_crop(Image.open(img.as_py()), new_resolution) for img in batch[IMAGE_COLUMN_NAME]]
+            images = [resize_and_crop(bytes_to_pil_image(img.as_py()), new_resolution) for img in batch[IMAGE_COLUMN_NAME]]
             image_tensors = torch.stack([preprocess_image(img) for img in images]).to(rank)
             
             # Generate captions
