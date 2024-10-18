@@ -159,9 +159,9 @@ def generate_captions(model, tokenizer, images):
 
 @torch.inference_mode()
 @torch.autocast(device_type="cuda", dtype=torch.float16)
-def generate_embeddings(model, tokenizer, captions):
+def generate_embeddings(model, tokenizer, captions, device):
     """Captions should be a list of strings"""
-    texts = tokenizer(captions, context_length=model.context_length)
+    texts = tokenizer(captions, context_length=model.context_length).to(device)
     text_embeddings = model.encode_text(texts)
 
     return text_embeddings
@@ -190,18 +190,19 @@ def download_and_queue_parquets(queue, download_progress, total_files, download_
 def process_parquets(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event):
     # Move CUDA initialization inside this function
     torch.cuda.set_device(rank)
-    
+    device = f"cuda:{rank}"
+
     model_id = "vikhyatk/moondream2"
     revision = "2024-08-26"
     moondream = AutoModelForCausalLM.from_pretrained(
         model_id, trust_remote_code=True, revision=revision, torch_dtype=torch.float16, cache_dir=f"{MODELS_DIR_BASE}/moondream"
-    ).to(rank)
+    ).to(device)
     moondream_tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
 
-    vae = AutoencoderKL.from_pretrained(f"{VAE_HF_NAME}", torch_dtype=torch.float16, cache_dir=f"{MODELS_DIR_BASE}/vae").to(rank)
+    vae = AutoencoderKL.from_pretrained(f"{VAE_HF_NAME}", torch_dtype=torch.float16, cache_dir=f"{MODELS_DIR_BASE}/vae").to(device)
 
     siglip_model, _ = create_model_from_pretrained(SIGLIP_HF_NAME, precision="fp16", cache_dir=f"{MODELS_DIR_BASE}/siglip")
-    siglip_model = siglip_model.to(rank)
+    siglip_model = siglip_model.to(device)
     siglip_tokenizer = get_tokenizer(SIGLIP_HF_NAME)
 
     bucket_manager = BucketManager()
@@ -229,7 +230,7 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
             # Resize images
             images = [bytes_to_pil_image(img.as_py()) for img in batch[IMAGE_COLUMN_NAME]]
             resized_images = [resize_and_crop(img, new_resolution) for img in images]
-            image_tensors = torch.stack([preprocess_image(img) for img in resized_images]).to(rank)
+            image_tensors = torch.stack([preprocess_image(img) for img in resized_images]).to(device)
             
             # Generate captions
             captions = generate_captions(moondream, moondream_tokenizer, images)
@@ -238,7 +239,7 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
             latents = generate_latents(vae, image_tensors)
             
             # Generate text embeddings
-            text_embeddings = generate_embeddings(siglip_model, siglip_tokenizer, captions)
+            text_embeddings = generate_embeddings(siglip_model, siglip_tokenizer, captions, device)
             
             # Add only processed outputs to new rows
             for i in range(len(batch)):
