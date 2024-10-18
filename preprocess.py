@@ -16,6 +16,7 @@ from tqdm import tqdm
 from huggingface_hub import HfFileSystem, hf_hub_download, HfApi
 import threading
 import io
+from requests.exceptions import RequestException
 
 DATASET = "commoncatalog-cc-by-nd"
 DATASET_DIR_BASE = "../../datasets"
@@ -188,13 +189,21 @@ def add_processed_file(tracking_file, filename):
     with open(tracking_file, 'a') as f:
         f.write(f"{filename}\n")
 
+def download_with_retry(repo_id, filename, repo_type, local_dir, max_retries=500, retry_delay=60):
+    for attempt in range(max_retries):
+        try:
+            return hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type, local_dir=local_dir)
+        except RequestException as e:
+            if attempt < max_retries - 1:
+                print(f"Download failed. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(retry_delay)
+            else:
+                print(f"Max retries reached. Skipping file: {filename}")
+                return None
+
 def download_and_queue_parquets(queue, download_progress, total_files, download_complete_event, tracking_file, pause_event):
     fs = HfFileSystem()
-    parquet_files = []
-    for partition in PARTITIONS:
-        p_f = fs.glob(f"datasets/common-canvas/{DATASET}/{str(partition)}/**/*.parquet")
-        parquet_files.extend(p_f)
-    
+    parquet_files = fs.glob(f"datasets/common-canvas/{DATASET}/**/*.parquet")
     processed_files = get_processed_files(tracking_file)
     
     unprocessed_files = [file for file in parquet_files if os.path.basename(file) not in processed_files]
@@ -204,10 +213,17 @@ def download_and_queue_parquets(queue, download_progress, total_files, download_
         # Check if download should be paused
         pause_event.wait()
         
-        local_file = hf_hub_download(repo_id=f"common-canvas/{DATASET}", filename=file.split(f"{DATASET}/")[-1], repo_type="dataset", local_dir=f"{DATASET_DIR_BASE}/{DATASET}")
-        queue.put(local_file)
-        with download_progress.get_lock():
-            download_progress.value += 1
+        local_file = download_with_retry(
+            repo_id=f"common-canvas/{DATASET}",
+            filename=file.split(f"{DATASET}/")[-1],
+            repo_type="dataset",
+            local_dir=f"{DATASET_DIR_BASE}/{DATASET}"
+        )
+        
+        if local_file:
+            queue.put(local_file)
+            with download_progress.get_lock():
+                download_progress.value += 1
     
     download_complete_event.set()
 
