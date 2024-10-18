@@ -13,7 +13,7 @@ from torchvision import transforms
 from torch.multiprocessing import Queue, Process, Value, Event, set_start_method
 import torch.distributed as dist
 from tqdm import tqdm
-from huggingface_hub import HfFileSystem, hf_hub_download
+from huggingface_hub import HfFileSystem, hf_hub_download, HfApi
 import threading
 import io
 
@@ -27,6 +27,9 @@ IMAGE_ID_COLUMN_NAME = "key"
 BS = 32
 # Deletes original parquet files after processing
 DELETE_AFTER_PROCESSING = True
+UPLOAD_TO_HUGGINGFACE = True
+USERNAME = "SwayStar123"
+PARTITIONS = [0,1,2,3,4,5,6,7,8,9]
 
 def get_prng(seed):
     return np.random.RandomState(seed)
@@ -185,21 +188,37 @@ def add_processed_file(tracking_file, filename):
     with open(tracking_file, 'a') as f:
         f.write(f"{filename}\n")
 
-def download_and_queue_parquets(queue, download_progress, total_files, download_complete_event, tracking_file):
+def download_and_queue_parquets(queue, download_progress, total_files, download_complete_event, tracking_file, pause_event):
     fs = HfFileSystem()
-    parquet_files = fs.glob(f"datasets/common-canvas/{DATASET}/**/*.parquet")
+    parquet_files = []
+    for partition in PARTITIONS:
+        p_f = fs.glob(f"datasets/common-canvas/{DATASET}/{str(partition)}/**/*.parquet")
+        parquet_files.extend(p_f)
+    
     processed_files = get_processed_files(tracking_file)
     
     unprocessed_files = [file for file in parquet_files if os.path.basename(file) not in processed_files]
     total_files.value = len(unprocessed_files)
     
     for file in unprocessed_files:
+        # Check if download should be paused
+        pause_event.wait()
+        
         local_file = hf_hub_download(repo_id=f"common-canvas/{DATASET}", filename=file.split(f"{DATASET}/")[-1], repo_type="dataset", local_dir=f"{DATASET_DIR_BASE}/{DATASET}")
         queue.put(local_file)
         with download_progress.get_lock():
             download_progress.value += 1
     
     download_complete_event.set()
+
+def upload_to_huggingface(file_path, path_in_repo):
+    api = HfApi()
+    api.upload_file(
+        path_or_fileobj=file_path,
+        path_in_repo=path_in_repo,
+        repo_id=f"{USERNAME}/preprocessed_{DATASET}",
+        repo_type="dataset",
+    )
 
 def process_parquets(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file):
     # Move CUDA initialization inside this function
@@ -281,10 +300,16 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
         new_parquet_path = os.path.join(new_parquet_dir, os.path.basename(parquet_filepath))
         pq.write_table(new_df, new_parquet_path)
 
+        if UPLOAD_TO_HUGGINGFACE:
+            name_in_repo = f"{new_resolution[1]}x{new_resolution[0]}/{os.path.basename(parquet_filepath)}"
+            upload_to_huggingface(new_parquet_path, name_in_repo)
+
         add_processed_file(tracking_file, os.path.basename(parquet_filepath))
 
         # Delete original parquet file if DELETE_AFTER_PROCESSING is True
         if DELETE_AFTER_PROCESSING:
+            if UPLOAD_TO_HUGGINGFACE:
+                os.remove(new_parquet_path) 
             os.remove(parquet_filepath)
 
         # Update process progress
@@ -302,12 +327,14 @@ def process_dataset():
     total_files = Value('i', 0)
     total_images = Value('i', 0)
     download_complete_event = Event()
+    pause_event = Event()
+    pause_event.set()  # Start in a non-paused state
     
     # Create tracking file path
     tracking_file = os.path.join(DATASET_DIR_BASE, f"{DATASET}_processed_files.txt")
     
     # Start the download thread
-    download_thread = threading.Thread(target=download_and_queue_parquets, args=(queue, download_progress, total_files, download_complete_event, tracking_file))
+    download_thread = threading.Thread(target=download_and_queue_parquets, args=(queue, download_progress, total_files, download_complete_event, tracking_file, pause_event))
     download_thread.start()
     
     processes = []
@@ -344,6 +371,12 @@ def process_dataset():
                     img_per_second = (img_per_second + new_images) / 2  # Average of overall and recent speed
                 
                 process_pbar.set_postfix({'img/s': f'{img_per_second:.2f}'})
+            
+            # Pause or resume download based on queue size
+            if queue.qsize() > world_size * 2:
+                pause_event.clear()  # Pause download
+            else:
+                pause_event.set()  # Resume download
             
             download_pbar.refresh()
             process_pbar.refresh()
