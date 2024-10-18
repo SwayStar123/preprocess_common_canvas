@@ -17,14 +17,14 @@ from huggingface_hub import HfFileSystem, hf_hub_download
 import threading
 import io
 
-DATASET = "commoncatalog-cc-by"
-DATASET_DIR_BASE = "../../datasets"
-MODELS_DIR_BASE = "../../models"
+DATASET = "commoncatalog-cc-by-nd"
+DATASET_DIR_BASE = "../datasets"
+MODELS_DIR_BASE = "../models"
 VAE_HF_NAME = "madebyollin/sdxl-vae-fp16-fix"
 SIGLIP_HF_NAME = "hf-hub:timm/ViT-SO400M-14-SigLIP-384"
 IMAGE_COLUMN_NAME = "jpg"
 IMAGE_ID_COLUMN_NAME = "key"
-BS = 64
+BS = 32
 # Deletes original parquet files after processing
 DELETE_AFTER_PROCESSING = True
 
@@ -174,12 +174,26 @@ def generate_latents(model, images):
 
     return latents
 
-def download_and_queue_parquets(queue, download_progress, total_files, download_complete_event):
+def get_processed_files(tracking_file):
+    processed_files = set()
+    if os.path.exists(tracking_file):
+        with open(tracking_file, 'r') as f:
+            processed_files = set(line.strip() for line in f)
+    return processed_files
+
+def add_processed_file(tracking_file, filename):
+    with open(tracking_file, 'a') as f:
+        f.write(f"{filename}\n")
+
+def download_and_queue_parquets(queue, download_progress, total_files, download_complete_event, tracking_file):
     fs = HfFileSystem()
     parquet_files = fs.glob(f"datasets/common-canvas/{DATASET}/**/*.parquet")
-    total_files.value = len(parquet_files)
+    processed_files = get_processed_files(tracking_file)
     
-    for file in parquet_files:
+    unprocessed_files = [file for file in parquet_files if os.path.basename(file) not in processed_files]
+    total_files.value = len(unprocessed_files)
+    
+    for file in unprocessed_files:
         local_file = hf_hub_download(repo_id=f"common-canvas/{DATASET}", filename=file.split(f"{DATASET}/")[-1], repo_type="dataset", local_dir=f"{DATASET_DIR_BASE}/{DATASET}")
         queue.put(local_file)
         with download_progress.get_lock():
@@ -187,11 +201,11 @@ def download_and_queue_parquets(queue, download_progress, total_files, download_
     
     download_complete_event.set()
 
-def process_parquets(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event):
+def process_parquets(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file):
     # Move CUDA initialization inside this function
     torch.cuda.set_device(rank)
     device = f"cuda:{rank}"
-
+    
     model_id = "vikhyatk/moondream2"
     revision = "2024-08-26"
     moondream = AutoModelForCausalLM.from_pretrained(
@@ -211,6 +225,9 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
         try:
             parquet_filepath = queue.get(timeout=10)
         except:
+            continue
+
+        if os.path.basename(parquet_filepath) in get_processed_files(tracking_file):
             continue
 
         # Load parquet file
@@ -264,6 +281,8 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
         new_parquet_path = os.path.join(new_parquet_dir, os.path.basename(parquet_filepath))
         pq.write_table(new_df, new_parquet_path)
 
+        add_processed_file(tracking_file, os.path.basename(parquet_filepath))
+
         # Delete original parquet file if DELETE_AFTER_PROCESSING is True
         if DELETE_AFTER_PROCESSING:
             os.remove(parquet_filepath)
@@ -284,13 +303,16 @@ def process_dataset():
     total_images = Value('i', 0)
     download_complete_event = Event()
     
+    # Create tracking file path
+    tracking_file = os.path.join(DATASET_DIR_BASE, f"{DATASET}_processed_files.txt")
+    
     # Start the download thread
-    download_thread = threading.Thread(target=download_and_queue_parquets, args=(queue, download_progress, total_files, download_complete_event))
+    download_thread = threading.Thread(target=download_and_queue_parquets, args=(queue, download_progress, total_files, download_complete_event, tracking_file))
     download_thread.start()
     
     processes = []
     for rank in range(world_size):
-        p = Process(target=process_parquets, args=(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event))
+        p = Process(target=process_parquets, args=(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file))
         p.start()
         processes.append(p)
     
@@ -319,8 +341,7 @@ def process_dataset():
                 img_per_second = current_images / elapsed_time
                 new_images = current_images - last_images
                 if new_images > 0:
-                    recent_img_per_second = new_images / 0.1  # Assuming 0.1s sleep time
-                    img_per_second = (img_per_second + recent_img_per_second) / 2  # Average of overall and recent speed
+                    img_per_second = (img_per_second + new_images) / 2  # Average of overall and recent speed
                 
                 process_pbar.set_postfix({'img/s': f'{img_per_second:.2f}'})
             
@@ -328,7 +349,7 @@ def process_dataset():
             process_pbar.refresh()
             
             last_images = current_images
-            time.sleep(0.1)
+            time.sleep(1)
     
     download_thread.join()
     for p in processes:
