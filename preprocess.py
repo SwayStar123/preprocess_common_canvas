@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 import numpy as np
 from PIL import Image
 from torchvision import transforms
-from torch.multiprocessing import Queue, Process, Value, Event
+from torch.multiprocessing import Queue, Process, Value, Event, set_start_method
 import torch.distributed as dist
 from tqdm import tqdm
 from huggingface_hub import HfFileSystem, hf_hub_download
@@ -183,7 +183,23 @@ def download_and_queue_parquets(queue, download_progress, total_files, download_
     
     download_complete_event.set()
 
-def process_parquets(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer):
+def process_parquets(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event):
+    # Move CUDA initialization inside this function
+    torch.cuda.set_device(rank)
+    
+    model_id = "vikhyatk/moondream2"
+    revision = "2024-08-26"
+    moondream = AutoModelForCausalLM.from_pretrained(
+        model_id, trust_remote_code=True, revision=revision, torch_dtype=torch.float16, cache_dir=f"{MODELS_DIR_BASE}/moondream"
+    ).to(rank)
+    moondream_tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
+
+    vae = AutoencoderKL.from_pretrained(f"{VAE_HF_NAME}", torch_dtype=torch.float16, cache_dir=f"{MODELS_DIR_BASE}/vae").to(rank)
+
+    siglip_model, _ = create_model_from_pretrained(SIGLIP_HF_NAME, precision="fp16", cache_dir=f"{MODELS_DIR_BASE}/siglip")
+    siglip_model = siglip_model.to(rank)
+    siglip_tokenizer = get_tokenizer(SIGLIP_HF_NAME)
+
     bucket_manager = BucketManager()
     
     while not (download_complete_event.is_set() and queue.empty()):
@@ -196,8 +212,10 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
         df = pq.read_table(parquet_filepath)
         
         # Get ideal resolution
-        original_resolution = batch[IMAGE_COLUMN_NAME][0].size
+        sample_image = Image.open(df[IMAGE_COLUMN_NAME][0].as_py())
+        original_resolution = sample_image.size
         new_resolution = bucket_manager.get_ideal_resolution(original_resolution)
+        sample_image.close()
         
         new_rows = []
         
@@ -205,8 +223,8 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
             batch = df.slice(batch_start, BS)
             
             # Resize images
-            images = [resize_and_crop(img, new_resolution) for img in batch[IMAGE_COLUMN_NAME]]
-            image_tensors = torch.stack([preprocess_image(img) for img in images])
+            images = [resize_and_crop(Image.open(img.as_py()), new_resolution) for img in batch[IMAGE_COLUMN_NAME]]
+            image_tensors = torch.stack([preprocess_image(img) for img in images]).to(rank)
             
             # Generate captions
             captions = generate_captions(moondream, moondream_tokenizer, image_tensors)
@@ -230,9 +248,6 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
             # Update total images processed
             with total_images.get_lock():
                 total_images.value += len(batch)
-
-            with process_progress.get_lock():
-                process_progress.value += 1
         
         # Create new parquet file
         new_df = pa.Table.from_pylist(new_rows)
@@ -245,28 +260,14 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
         if DELETE_AFTER_PROCESSING:
             os.remove(parquet_filepath)
 
-def init_process(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, fn, backend='nccl'):
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '29500'
-    dist.init_process_group(backend, rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-    
-    model_id = "vikhyatk/moondream2"
-    revision = "2024-08-26"
-    moondream = AutoModelForCausalLM.from_pretrained(
-        model_id, trust_remote_code=True, revision=revision, torch_dtype=torch.float16, cache_dir=f"{MODELS_DIR_BASE}/moondream"
-    ).to(rank)
-    moondream_tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
-
-    vae = AutoencoderKL.from_pretrained(f"{VAE_HF_NAME}", torch_dtype=torch.float16, cache_dir=f"{MODELS_DIR_BASE}/vae").to(rank)
-
-    siglip_model, _ = create_model_from_pretrained(SIGLIP_HF_NAME, precision="fp16", cache_dir=f"{MODELS_DIR_BASE}/siglip")
-    siglip_model = siglip_model.to(rank)
-    siglip_tokenizer = get_tokenizer(SIGLIP_HF_NAME)
-
-    fn(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer)
+        # Update process progress
+        with process_progress.get_lock():
+            process_progress.value += 1
 
 def process_dataset():
+    # Set start method to 'spawn'
+    set_start_method('spawn', force=True)
+
     world_size = torch.cuda.device_count()
     queue = Queue()
     download_progress = Value('i', 0)
@@ -281,7 +282,7 @@ def process_dataset():
     
     processes = []
     for rank in range(world_size):
-        p = Process(target=init_process, args=(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, process_parquets))
+        p = Process(target=process_parquets, args=(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event))
         p.start()
         processes.append(p)
     
