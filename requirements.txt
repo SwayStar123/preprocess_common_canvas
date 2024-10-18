@@ -4,7 +4,7 @@ open_clip_torch
 torch
 pyarrow
 tqdm
-huggingface_hub
+huggingface_hub[cli]
 hf_transfer
 einops
 accelerate
