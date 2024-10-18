@@ -172,7 +172,7 @@ def generate_latents(model, images):
 
 def download_and_queue_parquets(queue, progress_counter, total_files, download_complete_event):
     fs = HfFileSystem()
-    parquet_files = fs.glob(f"datasets/common-canvas/{DATASET}/**.parquet")
+    parquet_files = fs.glob(f"datasets/common-canvas/{DATASET}/**/*.parquet")
     total_files.value = len(parquet_files)
     
     for file in parquet_files:
