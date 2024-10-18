@@ -359,8 +359,8 @@ def process_dataset():
     set_start_method('spawn', force=True)
 
     world_size = torch.cuda.device_count()
-    upload_queue = Queue()
     queue = Queue()
+    upload_queue = Queue()
     download_progress = Value('i', 0)
     process_progress = Value('i', 0)
     total_files = Value('i', 0)
@@ -377,13 +377,14 @@ def process_dataset():
     download_thread = threading.Thread(target=download_and_queue_parquets, args=(queue, download_progress, total_files, download_complete_event, tracking_file, pause_event))
     download_thread.start()
 
+    # Start the upload thread if enabled
     if UPLOAD_TO_HUGGINGFACE:
         upload_thread = threading.Thread(target=upload_worker, args=(upload_queue, upload_complete_event))
         upload_thread.start()
     
     processes = []
     for rank in range(world_size):
-        p = Process(target=process_parquets, args=(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file))
+        p = Process(target=process_parquets, args=(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file, upload_queue))
         p.start()
         processes.append(p)
     
