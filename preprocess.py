@@ -226,14 +226,38 @@ def download_and_queue_parquets(queue, download_progress, total_files, download_
     
     download_complete_event.set()
 
-def upload_to_huggingface(file_path, path_in_repo):
+def upload_with_retry(file_path, name_in_repo, max_retries=500, retry_delay=60):
     api = HfApi()
-    api.upload_file(
-        path_or_fileobj=file_path,
-        path_in_repo=path_in_repo,
-        repo_id=f"{USERNAME}/preprocessed_{DATASET}",
-        repo_type="dataset",
-    )
+    for attempt in range(max_retries):
+        try:
+            api.upload_file(
+                path_or_fileobj=file_path,
+                path_in_repo=name_in_repo,
+                repo_id=f"{USERNAME}/preprocessed_{DATASET}",
+                repo_type="dataset",
+            )
+            return True
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"Upload failed: {str(e)}. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(retry_delay)
+            else:
+                print(f"Max retries reached. Failed to upload: {file_path}")
+                return False
+
+def upload_worker(upload_queue, upload_complete_event):
+    while not (upload_complete_event.is_set() and upload_queue.empty()):
+        try:
+            file_path, name_in_repo = upload_queue.get(timeout=10)
+        except:
+            continue
+
+        if upload_with_retry(file_path, name_in_repo):
+            print(f"Successfully uploaded: {file_path}")
+            if DELETE_AFTER_PROCESSING:
+                os.remove(file_path)
+        else:
+            print(f"Failed to upload: {file_path}")
 
 def process_parquets(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file):
     # Move CUDA initialization inside this function
@@ -316,7 +340,7 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
 
         if UPLOAD_TO_HUGGINGFACE:
             name_in_repo = f"{new_resolution[1]}x{new_resolution[0]}/{os.path.basename(parquet_filepath)}"
-            upload_to_huggingface(new_parquet_path, name_in_repo)
+            upload_queue.put((new_parquet_path, name_in_repo))
 
         add_processed_file(tracking_file, os.path.basename(parquet_filepath))
 
