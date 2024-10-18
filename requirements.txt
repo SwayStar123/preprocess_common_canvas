@@ -4,3 +4,5 @@ open_clip_torch
 torch
 pyarrow
 tqdm
+huggingface_hub
+hf_transfer

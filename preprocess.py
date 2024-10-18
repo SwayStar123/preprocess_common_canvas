@@ -10,9 +10,11 @@ import pyarrow.parquet as pq
 import numpy as np
 from PIL import Image
 from torchvision import transforms
-from torch.multiprocessing import Queue, Process, Value
+from torch.multiprocessing import Queue, Process, Value, Event
 import torch.distributed as dist
 from tqdm import tqdm
+from huggingface_hub import HfFileSystem, hf_hub_download
+import threading
 
 DATASET = "commoncatalog-cc-by"
 DATASET_DIR_BASE = "../../datasets"
@@ -139,67 +141,6 @@ def preprocess_image(image):
     image_tensor = transform(image)
     return image_tensor
 
-def collect_and_move_parquets(base_dir):
-    # aspect ratio : list of parquet filepaths
-    aspect_ratio_parquets = {}
-
-    base_dir = os.path.join(base_dir, DATASET)
-
-    # Cycle through 0 to 9
-    for i in range(10):
-        # Construct the path for the i-th folder
-        i_folder_path = os.path.join(base_dir, str(i))
-        
-        # Check if the folder exists
-        if not os.path.exists(i_folder_path):
-            continue
-
-        # Cycle through all the resolution folders in the i-th folder
-        for resolution_folder in os.listdir(i_folder_path):
-            resolution_folder_path = os.path.join(i_folder_path, resolution_folder)
-            
-            # Check if it's a directory
-            if not os.path.isdir(resolution_folder_path):
-                continue
-
-            # Cycle through all the aspect ratio folders in the resolution folder
-            for aspect_ratio_folder in os.listdir(resolution_folder_path):
-                aspect_ratio_folder_path = os.path.join(resolution_folder_path, aspect_ratio_folder)
-                
-                # Check if it's a directory
-                if not os.path.isdir(aspect_ratio_folder_path):
-                    continue
-
-                # Collect all parquet files in the aspect ratio folder
-                for parquet_file in os.listdir(aspect_ratio_folder_path):
-                    if parquet_file.endswith('.parquet'):
-                        parquet_file_path = os.path.join(aspect_ratio_folder_path, parquet_file)
-                        
-                        # Add the file path to the aspect ratio dictionary
-                        if aspect_ratio_folder not in aspect_ratio_parquets:
-                            aspect_ratio_parquets[aspect_ratio_folder] = []
-                        aspect_ratio_parquets[aspect_ratio_folder].append(parquet_file_path)
-
-    # filepath : aspect ratio
-    new_parquet_filepaths = {}
-
-    # Move files to new structure
-    for aspect_ratio, file_paths in aspect_ratio_parquets.items():
-        # Create new directory for the aspect ratio if it doesn't exist
-        new_dir = os.path.join(base_dir, f"reorged_{DATASET}")
-        new_dir = os.path.join(new_dir, aspect_ratio)
-
-        os.makedirs(new_dir, exist_ok=True)
-
-        # Move each file to the new directory
-        for file_path in file_paths:
-            shutil.move(file_path, new_dir)
-            new_filepath = os.path.join(new_dir, os.path.basename(file_path))
-            new_parquet_filepaths[new_filepath] = aspect_ratio
-
-    return new_parquet_filepaths
-
-
 @torch.inference_mode()
 @torch.autocast(device_type="cuda", dtype=torch.float16)
 def generate_captions(model, tokenizer, images):
@@ -229,12 +170,27 @@ def generate_latents(model, images):
 
     return latents
 
-def process_parquets(queue, progress_counter, total_images, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer, bucket_manager):
-    while True:
+def download_and_queue_parquets(queue, progress_counter, total_files, download_complete_event):
+    fs = HfFileSystem()
+    parquet_files = fs.glob(f"datasets/common-canvas/{DATASET}/**.parquet")
+    total_files.value = len(parquet_files)
+    
+    for file in parquet_files:
+        local_file = hf_hub_download(repo_id=f"common-canvas/{DATASET}", filename=file.split(f"{DATASET}/")[-1], repo_type="dataset", local_dir=f"{DATASET_DIR_BASE}/{DATASET}")
+        queue.put(local_file)
+        with progress_counter.get_lock():
+            progress_counter.value += 1
+    
+    download_complete_event.set()
+
+def process_parquets(rank, world_size, queue, progress_counter, total_files, total_images, download_complete_event, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer):
+    bucket_manager = BucketManager()
+    
+    while not (download_complete_event.is_set() and queue.empty()):
         try:
             parquet_filepath = queue.get(timeout=10)
         except:
-            break
+            continue
 
         # Load parquet file
         df = pq.read_table(parquet_filepath)
@@ -261,7 +217,7 @@ def process_parquets(queue, progress_counter, total_images, moondream, moondream
             # Generate text embeddings
             text_embeddings = generate_embeddings(siglip_model, siglip_tokenizer, captions)
             
-            # Add processed outputs to new rows
+            # Add only processed outputs to new rows
             for i in range(len(batch)):
                 new_row = {
                     'image_id': batch[IMAGE_ID_COLUMN_NAME][i].as_py(),
@@ -270,7 +226,8 @@ def process_parquets(queue, progress_counter, total_images, moondream, moondream
                     'text_embedding': text_embeddings[i].cpu().numpy()
                 }
                 new_rows.append(new_row)
-
+            
+            # Update total images processed
             with total_images.get_lock():
                 total_images.value += len(batch)
         
@@ -281,14 +238,12 @@ def process_parquets(queue, progress_counter, total_images, moondream, moondream
         new_parquet_path = os.path.join(new_parquet_dir, os.path.basename(parquet_filepath))
         pq.write_table(new_df, new_parquet_path)
 
+        # Delete original parquet file if DELETE_AFTER_PROCESSING is True
         if DELETE_AFTER_PROCESSING:
             os.remove(parquet_filepath)
 
-        with progress_counter.get_lock():
-            progress_counter.value += 1
-
-def init_process(rank, world_size, queue, progress_counter, total_images, fn, backend='nccl'):
-    os.environ['MASTER_ADDR'] = 'localhost'
+def init_process(rank, world_size, queue, progress_counter, total_files, total_images, download_complete_event, fn, backend='nccl'):
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
     dist.init_process_group(backend, rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
@@ -306,37 +261,38 @@ def init_process(rank, world_size, queue, progress_counter, total_images, fn, ba
     siglip_model = siglip_model.to(rank)
     siglip_tokenizer = get_tokenizer(SIGLIP_HF_NAME)
 
-    bucket_manager = BucketManager()
-
-    fn(queue, progress_counter, total_images, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer, bucket_manager)
+    fn(rank, world_size, queue, progress_counter, total_files, total_images, download_complete_event, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer)
 
 def process_dataset():
-    parquet_paths = collect_and_move_parquets(DATASET_DIR_BASE)
-    
     world_size = torch.cuda.device_count()
     queue = Queue()
-    
-    for path in parquet_paths:
-        queue.put(path)
-    
-    total_files = len(parquet_paths)
     progress_counter = Value('i', 0)
+    total_files = Value('i', 0)
     total_images = Value('i', 0)
+    download_complete_event = Event()
+    
+    # Start the download thread
+    download_thread = threading.Thread(target=download_and_queue_parquets, args=(queue, progress_counter, total_files, download_complete_event))
+    download_thread.start()
     
     processes = []
     for rank in range(world_size):
-        p = Process(target=init_process, args=(rank, world_size, queue, progress_counter, total_images, process_parquets))
+        p = Process(target=init_process, args=(rank, world_size, queue, progress_counter, total_files, total_images, download_complete_event, process_parquets))
         p.start()
         processes.append(p)
     
-    # Progress bar
+    # Progress bar with img/s estimate
     start_time = time.time()
-    with tqdm(total=total_files, desc="Processing parquet files") as pbar:
+    with tqdm(total=None, desc="Processing parquet files") as pbar:
         last_images = 0
-        while progress_counter.value < total_files:
+        while not (download_complete_event.is_set() and queue.empty()):
             current_progress = progress_counter.value
             current_images = total_images.value
             elapsed_time = time.time() - start_time
+            
+            # Update total if changed
+            if pbar.total != total_files.value:
+                pbar.total = total_files.value
             
             # Calculate images per second
             if elapsed_time > 0:
@@ -354,8 +310,9 @@ def process_dataset():
             last_images = current_images
             time.sleep(0.1)
     
+    download_thread.join()
     for p in processes:
         p.join()
+
 if __name__ == "__main__":
     process_dataset()
-
