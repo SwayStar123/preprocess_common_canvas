@@ -229,7 +229,7 @@ def generate_latents(model, images):
 
     return latents
 
-def process_parquets(queue, progress_counter, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer, bucket_manager):
+def process_parquets(queue, progress_counter, total_images, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer, bucket_manager):
     while True:
         try:
             parquet_filepath = queue.get(timeout=10)
@@ -270,6 +270,9 @@ def process_parquets(queue, progress_counter, moondream, moondream_tokenizer, va
                     'text_embedding': text_embeddings[i].cpu().numpy()
                 }
                 new_rows.append(new_row)
+
+            with total_images.get_lock():
+                total_images.value += len(batch)
         
         # Create new parquet file
         new_df = pa.Table.from_pylist(new_rows)
@@ -284,7 +287,7 @@ def process_parquets(queue, progress_counter, moondream, moondream_tokenizer, va
         with progress_counter.get_lock():
             progress_counter.value += 1
 
-def init_process(rank, world_size, queue, progress_counter, fn, backend='nccl'):
+def init_process(rank, world_size, queue, progress_counter, total_images, fn, backend='nccl'):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '29500'
     dist.init_process_group(backend, rank=rank, world_size=world_size)
@@ -305,7 +308,7 @@ def init_process(rank, world_size, queue, progress_counter, fn, backend='nccl'):
 
     bucket_manager = BucketManager()
 
-    fn(queue, progress_counter, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer, bucket_manager)
+    fn(queue, progress_counter, total_images, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer, bucket_manager)
 
 def process_dataset():
     parquet_paths = collect_and_move_parquets(DATASET_DIR_BASE)
@@ -318,19 +321,37 @@ def process_dataset():
     
     total_files = len(parquet_paths)
     progress_counter = Value('i', 0)
+    total_images = Value('i', 0)
     
     processes = []
     for rank in range(world_size):
-        p = Process(target=init_process, args=(rank, world_size, queue, progress_counter, process_parquets))
+        p = Process(target=init_process, args=(rank, world_size, queue, progress_counter, total_images, process_parquets))
         p.start()
         processes.append(p)
     
     # Progress bar
+    start_time = time.time()
     with tqdm(total=total_files, desc="Processing parquet files") as pbar:
+        last_images = 0
         while progress_counter.value < total_files:
             current_progress = progress_counter.value
+            current_images = total_images.value
+            elapsed_time = time.time() - start_time
+            
+            # Calculate images per second
+            if elapsed_time > 0:
+                img_per_second = current_images / elapsed_time
+                new_images = current_images - last_images
+                if new_images > 0:
+                    recent_img_per_second = new_images / 0.1  # Assuming 0.1s sleep time
+                    img_per_second = (img_per_second + recent_img_per_second) / 2  # Average of overall and recent speed
+                
+                pbar.set_postfix({'img/s': f'{img_per_second:.2f}'})
+            
             pbar.n = current_progress
             pbar.refresh()
+            
+            last_images = current_images
             time.sleep(0.1)
     
     for p in processes:
