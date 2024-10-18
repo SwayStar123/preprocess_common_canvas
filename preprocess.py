@@ -346,8 +346,6 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
 
         # Delete original parquet file if DELETE_AFTER_PROCESSING is True
         if DELETE_AFTER_PROCESSING:
-            if UPLOAD_TO_HUGGINGFACE:
-                os.remove(new_parquet_path) 
             os.remove(parquet_filepath)
 
         # Update process progress
