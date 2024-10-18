@@ -18,8 +18,8 @@ import threading
 import io
 
 DATASET = "commoncatalog-cc-by-nd"
-DATASET_DIR_BASE = "../datasets"
-MODELS_DIR_BASE = "../models"
+DATASET_DIR_BASE = "../../datasets"
+MODELS_DIR_BASE = "../../models"
 VAE_HF_NAME = "madebyollin/sdxl-vae-fp16-fix"
 SIGLIP_HF_NAME = "hf-hub:timm/ViT-SO400M-14-SigLIP-384"
 IMAGE_COLUMN_NAME = "jpg"
@@ -285,7 +285,6 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
                     'vae_latent': latents[i].cpu().numpy().tobytes(),  # Convert to bytes
                     'vae_latent_shape': latents[i].shape,  # Store shape separately
                     'text_embedding': text_embeddings[i].cpu().numpy().tobytes(),  # Convert to bytes
-                    'text_embedding_shape': text_embeddings[i].shape,  # Store shape separately
                 }
                 new_rows.append(new_row)
             
