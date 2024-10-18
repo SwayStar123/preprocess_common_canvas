@@ -16,7 +16,6 @@ from tqdm import tqdm
 from huggingface_hub import HfFileSystem, hf_hub_download, HfApi
 import threading
 import io
-from requests.exceptions import RequestException
 
 DATASET = "commoncatalog-cc-by-nd"
 DATASET_DIR_BASE = "../../datasets"
@@ -193,7 +192,7 @@ def download_with_retry(repo_id, filename, repo_type, local_dir, max_retries=500
     for attempt in range(max_retries):
         try:
             return hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type, local_dir=local_dir)
-        except RequestException as e:
+        except Exception as e:
             if attempt < max_retries - 1:
                 print(f"Download failed. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
                 time.sleep(retry_delay)
