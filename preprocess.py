@@ -10,8 +10,9 @@ import pyarrow.parquet as pq
 import numpy as np
 from PIL import Image
 from torchvision import transforms
-from torch.multiprocessing import Queue, Process
+from torch.multiprocessing import Queue, Process, Value
 import torch.distributed as dist
+from tqdm import tqdm
 
 DATASET = "commoncatalog-cc-by"
 DATASET_DIR_BASE = "../../datasets"
@@ -21,6 +22,8 @@ SIGLIP_HF_NAME = "hf-hub:timm/ViT-SO400M-14-SigLIP-384"
 IMAGE_COLUMN_NAME = "jpg"
 IMAGE_ID_COLUMN_NAME = "image_id"
 BS = 64
+# Deletes original parquet files after processing
+DELETE_AFTER_PROCESSING = True
 
 def get_prng(seed):
     return np.random.RandomState(seed)
@@ -226,7 +229,7 @@ def generate_latents(model, images):
 
     return latents
 
-def process_parquets(rank, world_size, queue, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer, bucket_manager):
+def process_parquets(queue, progress_counter, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer, bucket_manager):
     while True:
         try:
             parquet_filepath = queue.get(timeout=10)
@@ -275,7 +278,13 @@ def process_parquets(rank, world_size, queue, moondream, moondream_tokenizer, va
         new_parquet_path = os.path.join(new_parquet_dir, os.path.basename(parquet_filepath))
         pq.write_table(new_df, new_parquet_path)
 
-def init_process(rank, world_size, queue, fn, backend='nccl'):
+        if DELETE_AFTER_PROCESSING:
+            os.remove(parquet_filepath)
+
+        with progress_counter.get_lock():
+            progress_counter.value += 1
+
+def init_process(rank, world_size, queue, progress_counter, fn, backend='nccl'):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '29500'
     dist.init_process_group(backend, rank=rank, world_size=world_size)
@@ -296,7 +305,7 @@ def init_process(rank, world_size, queue, fn, backend='nccl'):
 
     bucket_manager = BucketManager()
 
-    fn(rank, world_size, queue, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer, bucket_manager)
+    fn(queue, progress_counter, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer, bucket_manager)
 
 def process_dataset():
     parquet_paths = collect_and_move_parquets(DATASET_DIR_BASE)
@@ -307,15 +316,25 @@ def process_dataset():
     for path in parquet_paths:
         queue.put(path)
     
+    total_files = len(parquet_paths)
+    progress_counter = Value('i', 0)
+    
     processes = []
     for rank in range(world_size):
-        p = Process(target=init_process, args=(rank, world_size, queue, process_parquets))
+        p = Process(target=init_process, args=(rank, world_size, queue, progress_counter, process_parquets))
         p.start()
         processes.append(p)
     
+    # Progress bar
+    with tqdm(total=total_files, desc="Processing parquet files") as pbar:
+        while progress_counter.value < total_files:
+            current_progress = progress_counter.value
+            pbar.n = current_progress
+            pbar.refresh()
+            time.sleep(0.1)
+    
     for p in processes:
         p.join()
-
 if __name__ == "__main__":
     process_dataset()
 

@@ -1,0 +1,6 @@
+transformers
+diffusers
+open_clip_torch
+torch
+pyarrow
+tqdm
