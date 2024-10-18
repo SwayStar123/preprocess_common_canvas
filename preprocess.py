@@ -259,7 +259,7 @@ def upload_worker(upload_queue, upload_complete_event):
         else:
             print(f"Failed to upload: {file_path}")
 
-def process_parquets(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file):
+def process_parquets(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file, upload_queue):
     # Move CUDA initialization inside this function
     torch.cuda.set_device(rank)
     device = f"cuda:{rank}"
@@ -359,12 +359,14 @@ def process_dataset():
     set_start_method('spawn', force=True)
 
     world_size = torch.cuda.device_count()
+    upload_queue = Queue()
     queue = Queue()
     download_progress = Value('i', 0)
     process_progress = Value('i', 0)
     total_files = Value('i', 0)
     total_images = Value('i', 0)
     download_complete_event = Event()
+    upload_complete_event = Event()
     pause_event = Event()
     pause_event.set()  # Start in a non-paused state
     
@@ -374,6 +376,10 @@ def process_dataset():
     # Start the download thread
     download_thread = threading.Thread(target=download_and_queue_parquets, args=(queue, download_progress, total_files, download_complete_event, tracking_file, pause_event))
     download_thread.start()
+
+    if UPLOAD_TO_HUGGINGFACE:
+        upload_thread = threading.Thread(target=upload_worker, args=(upload_queue, upload_complete_event))
+        upload_thread.start()
     
     processes = []
     for rank in range(world_size):
@@ -425,6 +431,10 @@ def process_dataset():
     download_thread.join()
     for p in processes:
         p.join()
+
+    if UPLOAD_TO_HUGGINGFACE:
+        upload_complete_event.set()
+        upload_thread.join()
 
 if __name__ == "__main__":
     process_dataset()
