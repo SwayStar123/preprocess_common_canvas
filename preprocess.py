@@ -246,8 +246,10 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
                 new_row = {
                     'image_id': batch[IMAGE_ID_COLUMN_NAME][i].as_py(),
                     'caption': captions[i],
-                    'vae_latent': latents[i].cpu().numpy(),
-                    'text_embedding': text_embeddings[i].cpu().numpy()
+                    'vae_latent': latents[i].cpu().numpy().tobytes(),  # Convert to bytes
+                    'vae_latent_shape': latents[i].shape,  # Store shape separately
+                    'text_embedding': text_embeddings[i].cpu().numpy().tobytes(),  # Convert to bytes
+                    'text_embedding_shape': text_embeddings[i].shape,  # Store shape separately
                 }
                 new_rows.append(new_row)
             
