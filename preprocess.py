@@ -170,7 +170,7 @@ def generate_latents(model, images):
 
     return latents
 
-def download_and_queue_parquets(queue, progress_counter, total_files, download_complete_event):
+def download_and_queue_parquets(queue, download_progress, total_files, download_complete_event):
     fs = HfFileSystem()
     parquet_files = fs.glob(f"datasets/common-canvas/{DATASET}/**/*.parquet")
     total_files.value = len(parquet_files)
@@ -178,12 +178,12 @@ def download_and_queue_parquets(queue, progress_counter, total_files, download_c
     for file in parquet_files:
         local_file = hf_hub_download(repo_id=f"common-canvas/{DATASET}", filename=file.split(f"{DATASET}/")[-1], repo_type="dataset", local_dir=f"{DATASET_DIR_BASE}/{DATASET}")
         queue.put(local_file)
-        with progress_counter.get_lock():
-            progress_counter.value += 1
+        with download_progress.get_lock():
+            download_progress.value += 1
     
     download_complete_event.set()
 
-def process_parquets(rank, world_size, queue, progress_counter, total_files, total_images, download_complete_event, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer):
+def process_parquets(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer):
     bucket_manager = BucketManager()
     
     while not (download_complete_event.is_set() and queue.empty()):
@@ -230,6 +230,9 @@ def process_parquets(rank, world_size, queue, progress_counter, total_files, tot
             # Update total images processed
             with total_images.get_lock():
                 total_images.value += len(batch)
+
+            with process_progress.get_lock():
+                process_progress.value += 1
         
         # Create new parquet file
         new_df = pa.Table.from_pylist(new_rows)
@@ -242,7 +245,7 @@ def process_parquets(rank, world_size, queue, progress_counter, total_files, tot
         if DELETE_AFTER_PROCESSING:
             os.remove(parquet_filepath)
 
-def init_process(rank, world_size, queue, progress_counter, total_files, total_images, download_complete_event, fn, backend='nccl'):
+def init_process(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, fn, backend='nccl'):
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
     dist.init_process_group(backend, rank=rank, world_size=world_size)
@@ -261,38 +264,46 @@ def init_process(rank, world_size, queue, progress_counter, total_files, total_i
     siglip_model = siglip_model.to(rank)
     siglip_tokenizer = get_tokenizer(SIGLIP_HF_NAME)
 
-    fn(rank, world_size, queue, progress_counter, total_files, total_images, download_complete_event, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer)
+    fn(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, moondream, moondream_tokenizer, vae, siglip_model, siglip_tokenizer)
 
 def process_dataset():
     world_size = torch.cuda.device_count()
     queue = Queue()
-    progress_counter = Value('i', 0)
+    download_progress = Value('i', 0)
+    process_progress = Value('i', 0)
     total_files = Value('i', 0)
     total_images = Value('i', 0)
     download_complete_event = Event()
     
     # Start the download thread
-    download_thread = threading.Thread(target=download_and_queue_parquets, args=(queue, progress_counter, total_files, download_complete_event))
+    download_thread = threading.Thread(target=download_and_queue_parquets, args=(queue, download_progress, total_files, download_complete_event))
     download_thread.start()
     
     processes = []
     for rank in range(world_size):
-        p = Process(target=init_process, args=(rank, world_size, queue, progress_counter, total_files, total_images, download_complete_event, process_parquets))
+        p = Process(target=init_process, args=(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, process_parquets))
         p.start()
         processes.append(p)
     
-    # Progress bar with img/s estimate
+    # Progress bars with img/s estimate
     start_time = time.time()
-    with tqdm(total=None, desc="Processing parquet files") as pbar:
+    with tqdm(total=None, desc="Downloading files", position=1) as download_pbar, \
+         tqdm(total=None, desc="Processing files", position=2) as process_pbar:
         last_images = 0
         while not (download_complete_event.is_set() and queue.empty()):
-            current_progress = progress_counter.value
+            current_download_progress = download_progress.value
+            current_process_progress = process_progress.value
             current_images = total_images.value
             elapsed_time = time.time() - start_time
             
-            # Update total if changed
-            if pbar.total != total_files.value:
-                pbar.total = total_files.value
+            # Update totals if changed
+            if download_pbar.total != total_files.value:
+                download_pbar.total = total_files.value
+                process_pbar.total = total_files.value
+            
+            # Update progress bars
+            download_pbar.n = current_download_progress
+            process_pbar.n = current_process_progress
             
             # Calculate images per second
             if elapsed_time > 0:
@@ -302,10 +313,10 @@ def process_dataset():
                     recent_img_per_second = new_images / 0.1  # Assuming 0.1s sleep time
                     img_per_second = (img_per_second + recent_img_per_second) / 2  # Average of overall and recent speed
                 
-                pbar.set_postfix({'img/s': f'{img_per_second:.2f}'})
+                process_pbar.set_postfix({'img/s': f'{img_per_second:.2f}'})
             
-            pbar.n = current_progress
-            pbar.refresh()
+            download_pbar.refresh()
+            process_pbar.refresh()
             
             last_images = current_images
             time.sleep(0.1)
