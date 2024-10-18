@@ -6,3 +6,4 @@ pyarrow
 tqdm
 huggingface_hub
 hf_transfer
+einops
