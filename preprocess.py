@@ -18,8 +18,8 @@ import threading
 import io
 
 DATASET = "commoncatalog-cc-by-nd"
-DATASET_DIR_BASE = "../../datasets"
-MODELS_DIR_BASE = "../../models"
+DATASET_DIR_BASE = "../datasets"
+MODELS_DIR_BASE = "../models"
 VAE_HF_NAME = "madebyollin/sdxl-vae-fp16-fix"
 SIGLIP_HF_NAME = "hf-hub:timm/ViT-SO400M-14-SigLIP-384"
 IMAGE_COLUMN_NAME = "jpg"
