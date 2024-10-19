@@ -206,9 +206,13 @@ def download_and_queue_parquets(queue, download_progress, total_files, download_
     for partition in PARTITIONS:
         p_f = fs.glob(f"datasets/common-canvas/{DATASET}/{str(partition)}/**/*.parquet")
         parquet_files.extend(p_f)
+
     processed_files = get_processed_files(tracking_file)
-    
-    unprocessed_files = [file for file in parquet_files if os.path.basename(file) not in processed_files]
+    processed_files_on_hub = fs.glob(f"datasets/{USERNAME}/preprocessed_{DATASET}/**/*.parquet")
+    processed_files_on_hub = set(os.path.basename(file) for file in processed_files_on_hub)
+
+    unprocessed_files = [file for file in parquet_files if os.path.basename(file) not in processed_files and os.path.basename(file) not in processed_files_on_hub]
+
     total_files.value = len(unprocessed_files)
     
     for file in unprocessed_files:
