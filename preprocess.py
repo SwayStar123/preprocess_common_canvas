@@ -202,7 +202,10 @@ def download_with_retry(repo_id, filename, repo_type, local_dir, max_retries=500
 
 def download_and_queue_parquets(queue, download_progress, total_files, download_complete_event, tracking_file, pause_event):
     fs = HfFileSystem()
-    parquet_files = fs.glob(f"datasets/common-canvas/{DATASET}/**/*.parquet")
+    parquet_files = []
+    for partition in PARTITIONS:
+        p_f = fs.glob(f"datasets/common-canvas/{DATASET}/{str(partition)}/**/*.parquet")
+        parquet_files.extend(p_f)
     processed_files = get_processed_files(tracking_file)
     
     unprocessed_files = [file for file in parquet_files if os.path.basename(file) not in processed_files]
