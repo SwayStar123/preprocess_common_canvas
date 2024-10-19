@@ -17,7 +17,7 @@ from huggingface_hub import HfFileSystem, hf_hub_download, HfApi
 import threading
 import io
 
-DATASET = "commoncatalog-cc-by-nd"
+DATASET = "commoncatalog-cc-by"
 DATASET_DIR_BASE = "../datasets"
 MODELS_DIR_BASE = "../models"
 VAE_HF_NAME = "madebyollin/sdxl-vae-fp16-fix"
