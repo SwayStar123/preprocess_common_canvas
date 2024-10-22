@@ -306,7 +306,7 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
         
         new_rows = []
         
-        for batch_start in range(0, len(df), BS):
+        for batch_start in tqdm(range(0, len(df), BS), desc=f"Processing {os.path.basename(parquet_filepath)}", position=3):
             batch = df.slice(batch_start, BS)
             
             # Resize images
