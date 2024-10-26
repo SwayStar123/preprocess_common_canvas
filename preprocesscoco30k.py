@@ -305,7 +305,7 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
                 'image_id': row[IMAGE_ID_COLUMN_NAME][0].as_py(),
                 'caption': caption,
                 'vae_latent': latent.cpu().numpy().flatten(),
-                'vae_latent_shape': latent.shape,  # Store shape separately
+                'vae_latent_shape': latent.shape[1:],  # Store shape separately. [1:] to remove batch dimension
                 'text_embedding': text_embedding.cpu().numpy().flatten(), # No need to save shape as its always 1152
             }
 
