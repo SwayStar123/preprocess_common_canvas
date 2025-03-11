@@ -1,43 +1,42 @@
 import os
 import shutil
+import tarfile
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from diffusers import AutoencoderDC
 import torch
-from open_clip import create_model_from_pretrained, get_tokenizer
 import time
 import pyarrow as pa
 import pyarrow.parquet as pq
 import numpy as np
 from PIL import Image
-from torchvision import transforms
+import torch.nn.functional as F
 from torch.multiprocessing import Queue, Process, Value, Event, set_start_method
-import torch.distributed as dist
-from tqdm import tqdm
-from huggingface_hub import HfFileSystem, hf_hub_download, HfApi
 import threading
 import io
 import json
-import torch.nn.functional as F
+from collections import defaultdict
+from tqdm import tqdm
+from huggingface_hub import HfFileSystem, hf_hub_download, HfApi
 
-DATASET = "commoncatalog-cc-by"
+DATASET_OWNER = "drawthingsai"
+DATASET = "megalith-10m"
 DATASET_DIR_BASE = "./datasets"
-MODELS_DIR_BASE = "./models"
+MODELS_DIR_BASE = "../../models"
 AE_HF_NAME = "mit-han-lab/dc-ae-f64c128-mix-1.0-diffusers"
 IMAGE_COLUMN_NAME = "jpg"
 IMAGE_ID_COLUMN_NAME = "key"
-BS = 128
-# Deletes original parquet files after processing
+BS = 32
 DELETE_AFTER_PROCESSING = True
 UPLOAD_TO_HUGGINGFACE = True
 UPLOAD_DS_PREFIX = "preprocessed_DCAE-f64_"
 USERNAME = "SwayStar123"
 PARTITIONS = [0,1,2,3,4,5,6,7,8,9]
 
-with open('prompts.json', 'r') as f:
-    captions = json.load(f)
+# with open('prompts.json', 'r') as f:
+#     captions = json.load(f)
 
 class BucketManager:
-    def __init__(self, max_size=(256,256), divisible=64, min_dim=128, base_res=(256,256), max_ar_error=4, dim_limit=512, debug=False):
+    def __init__(self, max_size=(256,256), divisible=64, min_dim=128, base_res=(256,256), dim_limit=512, debug=False):
         self.max_size = max_size
         self.f = 8
         self.max_tokens = (max_size[0]/self.f) * (max_size[1]/self.f)
@@ -45,7 +44,6 @@ class BucketManager:
         self.min_dim = min_dim
         self.dim_limit = dim_limit
         self.base_res = base_res
-        self.max_ar_error = max_ar_error
         self.debug = debug
 
         self.gen_buckets()
@@ -168,7 +166,6 @@ def preprocess_image(image, target_size, device='cuda'):
 def generate_latents(model, images):
     """Assumes all images are the same shape"""
     latents = model.encode(images).latent
-
     return latents
 
 def get_processed_files(tracking_file):
@@ -194,18 +191,16 @@ def download_with_retry(repo_id, filename, repo_type, local_dir, max_retries=500
                 print(f"Max retries reached. Skipping file: {filename}")
                 return None
 
-def download_and_queue_parquets(queue, download_progress, total_files, download_complete_event, tracking_file, pause_event):
+def download_and_queue_tars(queue, download_progress, total_files, download_complete_event, tracking_file, pause_event):
     fs = HfFileSystem()
-    parquet_files = []
-    for partition in PARTITIONS:
-        p_f = fs.glob(f"datasets/common-canvas/{DATASET}/{str(partition)}/**/*.parquet")
-        parquet_files.extend(p_f)
+
+    tar_files = fs.glob(f"datasets/{DATASET_OWNER}/{DATASET}/*.tar")
 
     processed_files = get_processed_files(tracking_file)
-    processed_files_on_hub = fs.glob(f"datasets/{USERNAME}/{UPLOAD_DS_PREFIX}{DATASET}/**/*.parquet")
-    processed_files_on_hub = set(os.path.basename(file) for file in processed_files_on_hub)
+    processed_files_on_hub = fs.glob(f"datasets/{USERNAME}/{UPLOAD_DS_PREFIX}{DATASET}/*.parquet")
+    processed_files_on_hub = set(os.path.basename(file).replace('.parquet', '.tar') for file in processed_files_on_hub)
 
-    unprocessed_files = [file for file in parquet_files if os.path.basename(file) not in processed_files and os.path.basename(file) not in processed_files_on_hub]
+    unprocessed_files = [file for file in tar_files if os.path.basename(file) not in processed_files and os.path.basename(file) not in processed_files_on_hub]
 
     total_files.value = len(unprocessed_files)
     
@@ -214,7 +209,7 @@ def download_and_queue_parquets(queue, download_progress, total_files, download_
         pause_event.wait()
         
         local_file = download_with_retry(
-            repo_id=f"common-canvas/{DATASET}",
+            repo_id=f"{DATASET_OWNER}/{DATASET}",
             filename=file.split(f"{DATASET}/")[-1],
             repo_type="dataset",
             local_dir=f"{DATASET_DIR_BASE}/{DATASET}"
@@ -260,60 +255,149 @@ def upload_worker(upload_queue, upload_complete_event):
         else:
             print(f"Failed to upload: {file_path}")
 
-def process_parquets(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file, upload_queue):
-    # Move CUDA initialization inside this function
-    torch.cuda.set_device(rank)
-    device = f"cuda:{rank}"
-
-    ae = AutoencoderDC.from_pretrained(f"{AE_HF_NAME}", torch_dtype=torch.float16, cache_dir=f"{MODELS_DIR_BASE}/ae").to(device)
-
-    bucket_manager = BucketManager()
+def extract_and_process_batch(images, image_ids, ae, device, bucket_manager):
+    # Get ideal resolution for first image
+    original_resolution = images[0].size
+    new_resolution = bucket_manager.get_ideal_resolution(original_resolution)
     
-    while not (download_complete_event.is_set() and queue.empty()):
+    # Resize and preprocess images
+    image_tensors = torch.stack([preprocess_image(img, new_resolution, device) for img in images]).to(device)
+    
+    # Generate AE latents
+    latents = generate_latents(ae, image_tensors).to(torch.float16)
+    
+    # Create rows
+    new_rows = []
+    for i in range(len(images)):
+        image_id = image_ids[i]
+        
+        # Get the three captions from the external JSON file for this image
+        # caption_data = captions.get(image_id, {})
+        # image_captions = [
+        #     caption_data.get("caption_sharecap_short", ""),
+        #     caption_data.get("caption_florence2_short", ""),
+        #     caption_data.get("caption_internlm2_short", "")
+        # ]
+        
+        new_row = {
+            'image_id': image_id,
+            # 'caption': image_captions,
+            'ae_latent': latents[i].cpu().numpy().flatten(),
+            'ae_latent_shape': latents[i].shape,
+        }
+        new_rows.append(new_row)
+    
+    return new_rows
+
+def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file):
+    # Extract tar file contents
+    extract_dir = os.path.join(os.path.dirname(tar_filepath), 'extracted_' + os.path.basename(tar_filepath).replace('.tar', ''))
+    os.makedirs(extract_dir, exist_ok=True)
+    
+    with tarfile.open(tar_filepath, 'r') as tar:
+        tar.extractall(path=extract_dir)
+    
+    # Find all JPG files and their corresponding JSON files
+    image_files = []
+    json_files = []
+    
+    for root, _, files in os.walk(extract_dir):
+        for file in files:
+            if file.endswith('.jpg'):
+                image_files.append(os.path.join(root, file))
+            elif file.endswith('.json') and not file.startswith('.'):  # Exclude the special PaxHeader files
+                json_files.append(os.path.join(root, file))
+    
+    # Check for valid files
+    if not image_files or not json_files:
+        print(f"No valid files found in {tar_filepath}")
+        if DELETE_AFTER_PROCESSING:
+            shutil.rmtree(extract_dir)
+            os.remove(tar_filepath)
+        return 0
+    
+    # Map JSON files to image files
+    file_pairs = []
+    for img_path in image_files:
+        img_basename = os.path.basename(img_path).split('.')[0]
+        matching_json = None
+        
+        for json_path in json_files:
+            json_basename = os.path.basename(json_path).split('.')[0]
+            if json_basename == img_basename:
+                matching_json = json_path
+                break
+        
+        if matching_json:
+            file_pairs.append((img_path, matching_json))
+    
+    if not file_pairs:
+        print(f"No valid file pairs found in {tar_filepath}")
+        if DELETE_AFTER_PROCESSING:
+            shutil.rmtree(extract_dir)
+            os.remove(tar_filepath)
+        return 0
+    
+    # Process images using shape batching
+    shape_batches = defaultdict(lambda: {'images': [], 'image_ids': []})
+    all_rows = []
+    total_processed = 0
+    
+    # First pass: organize images by shape
+    for img_path, json_path in file_pairs:
         try:
-            parquet_filepath = queue.get(timeout=10)
-        except:
-            continue
-
-        if os.path.basename(parquet_filepath) in get_processed_files(tracking_file):
-            continue
-
-        # Load parquet file
-        df = pq.read_table(parquet_filepath)
-        
-        # Get ideal resolution
-        sample_image_bytes = df[IMAGE_COLUMN_NAME][0].as_py()
-        sample_image = bytes_to_pil_image(sample_image_bytes)
-        original_resolution = sample_image.size
-        new_resolution = bucket_manager.get_ideal_resolution(original_resolution)
-        
-        new_rows = []
-        
-        for batch_start in tqdm(range(0, len(df), BS), desc=f"Processing {os.path.basename(parquet_filepath)}", position=3):
-            batch = df.slice(batch_start, BS)
+            # Get image ID from JSON
+            with open(json_path, 'r') as f:
+                metadata = json.load(f)
+                image_id = metadata.get('key')
             
-            # Resize images
-            images = [bytes_to_pil_image(img.as_py()) for img in batch[IMAGE_COLUMN_NAME]]
-            image_tensors = torch.stack([preprocess_image(img, new_resolution) for img in images]).to(device)
-
-            # Generate AE latents
-            latents = generate_latents(ae, image_tensors).to(torch.float16)
+            if not image_id:
+                continue
+                
+            img = Image.open(img_path)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+                
+            # Get resolution bucket
+            resolution = img.size
+            shape_batches[resolution]['images'].append(img)
+            shape_batches[resolution]['image_ids'].append(image_id)
             
-            # Add only processed outputs to new rows
-            for i in range(len(batch)):
-                image_id = batch[IMAGE_ID_COLUMN_NAME][i].as_py()
-                new_row = {
-                    'image_id': image_id,
-                    'caption': [batch["blip2_caption"][i], captions[image_id]],
-                    'ae_latent': latents[i].cpu().numpy().flatten(),
-                    'ae_latent_shape': latents[i].shape,
+            # If we have enough images of this shape, process them
+            if len(shape_batches[resolution]['images']) >= BS:
+                batch = {
+                    'images': shape_batches[resolution]['images'][:BS],
+                    'image_ids': shape_batches[resolution]['image_ids'][:BS]
                 }
-                new_rows.append(new_row)
+                
+                # Process batch
+                new_rows = extract_and_process_batch(
+                    batch['images'], batch['image_ids'], ae, device, bucket_manager
+                )
+                
+                all_rows.extend(new_rows)
+                total_processed += len(batch['images'])
+                
+                # Remove processed images from the batch
+                shape_batches[resolution]['images'] = shape_batches[resolution]['images'][BS:]
+                shape_batches[resolution]['image_ids'] = shape_batches[resolution]['image_ids'][BS:]
             
-            # Update total images processed
-            with total_images.get_lock():
-                total_images.value += len(batch)
-
+        except Exception as e:
+            print(f"Error processing image {img_path}: {str(e)}")
+    
+    # Process remaining items in shape batches
+    for resolution, batch in shape_batches.items():
+        if len(batch['images']) > 0:
+            # Process batch
+            new_rows = extract_and_process_batch(
+                batch['images'], batch['image_ids'], ae, device, bucket_manager
+            )
+            
+            all_rows.extend(new_rows)
+            total_processed += len(batch['images'])
+    
+    # Create and save parquet if we have processed rows
+    if all_rows:
         schema = pa.schema([
             ('image_id', pa.string()),
             ('caption', pa.list_(pa.string())),
@@ -321,22 +405,53 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
             ('ae_latent_shape', pa.list_(pa.int64())),
         ])
         
-        # Create new parquet file
-        new_df = pa.Table.from_pylist(new_rows, schema=schema)
-        new_parquet_dir = os.path.join(DATASET_DIR_BASE, f"{UPLOAD_DS_PREFIX}{DATASET}", f"{new_resolution[1]}x{new_resolution[0]}")
+        new_df = pa.Table.from_pylist(all_rows, schema=schema)
+        new_parquet_dir = os.path.join(DATASET_DIR_BASE, f"{UPLOAD_DS_PREFIX}{DATASET}")
         os.makedirs(new_parquet_dir, exist_ok=True)
-        new_parquet_path = os.path.join(new_parquet_dir, os.path.basename(parquet_filepath))
+        
+        # Use tar filename to create unique parquet filename
+        tar_base = os.path.basename(tar_filepath).replace('.tar', '')
+        parquet_filename = f"{tar_base}.parquet"
+        new_parquet_path = os.path.join(new_parquet_dir, parquet_filename)
         pq.write_table(new_df, new_parquet_path)
-
+        
         if UPLOAD_TO_HUGGINGFACE:
-            name_in_repo = f"{new_resolution[1]}x{new_resolution[0]}/{os.path.basename(parquet_filepath)}"
-            upload_queue.put((new_parquet_path, name_in_repo))
+            upload_queue.put((new_parquet_path, parquet_filename))
+    
+    # Clean up
+    if DELETE_AFTER_PROCESSING:
+        shutil.rmtree(extract_dir)
+        os.remove(tar_filepath)
+    
+    add_processed_file(tracking_file, os.path.basename(tar_filepath))
+    
+    return total_processed
 
-        add_processed_file(tracking_file, os.path.basename(parquet_filepath))
+def process_tars(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file, upload_queue):
+    # Move CUDA initialization inside this function
+    torch.cuda.set_device(rank)
+    device = f"cuda:{rank}"
 
-        # Delete original parquet file if DELETE_AFTER_PROCESSING is True
-        if DELETE_AFTER_PROCESSING:
-            os.remove(parquet_filepath)
+    ae = AutoencoderDC.from_pretrained(f"{AE_HF_NAME}", torch_dtype=torch.float16, cache_dir=f"{MODELS_DIR_BASE}/dc_ae").to(device)
+
+    bucket_manager = BucketManager()
+    
+    while not (download_complete_event.is_set() and queue.empty()):
+        try:
+            tar_filepath = queue.get(timeout=10)
+        except:
+            continue
+
+        if os.path.basename(tar_filepath) in get_processed_files(tracking_file):
+            continue
+
+        print(f"Processing {os.path.basename(tar_filepath)} on device {device}")
+        
+        images_processed = process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file)
+        
+        # Update total images processed
+        with total_images.get_lock():
+            total_images.value += images_processed
 
         # Update process progress
         with process_progress.get_lock():
@@ -362,7 +477,7 @@ def process_dataset():
     tracking_file = os.path.join(DATASET_DIR_BASE, f"{DATASET}_processed_files.txt")
     
     # Start the download thread
-    download_thread = threading.Thread(target=download_and_queue_parquets, args=(queue, download_progress, total_files, download_complete_event, tracking_file, pause_event))
+    download_thread = threading.Thread(target=download_and_queue_tars, args=(queue, download_progress, total_files, download_complete_event, tracking_file, pause_event))
     download_thread.start()
 
     # Start the upload thread if enabled
@@ -372,7 +487,7 @@ def process_dataset():
     
     processes = []
     for rank in range(world_size):
-        p = Process(target=process_parquets, args=(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file, upload_queue))
+        p = Process(target=process_tars, args=(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file, upload_queue))
         p.start()
         processes.append(p)
     
