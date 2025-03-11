@@ -206,7 +206,7 @@ def download_and_queue_tars(queue, download_progress, total_files, download_comp
     tar_files = fs.glob(f"datasets/{DATASET_OWNER}/{DATASET}/*.tar")
 
     processed_files = get_processed_files(tracking_file)
-    processed_files_on_hub = fs.glob(f"datasets/{USERNAME}/{UPLOAD_DS_PREFIX}{DATASET}/*.parquet")
+    processed_files_on_hub = fs.glob(f"datasets/{USERNAME}/{UPLOAD_DS_PREFIX}{DATASET}/data/*.parquet")
     processed_files_on_hub = set(os.path.basename(file).replace('.parquet', '.tar') for file in processed_files_on_hub)
 
     unprocessed_files = [file for file in tar_files if os.path.basename(file) not in processed_files and os.path.basename(file) not in processed_files_on_hub]
@@ -240,7 +240,7 @@ def upload_with_retry(file_path, name_in_repo, max_retries=500, retry_delay=60):
         try:
             api.upload_file(
                 path_or_fileobj=file_path,
-                path_in_repo=name_in_repo,
+                path_in_repo=f"data/{name_in_repo}",
                 repo_id=f"{USERNAME}/{UPLOAD_DS_PREFIX}{DATASET}",
                 repo_type="dataset",
             )
