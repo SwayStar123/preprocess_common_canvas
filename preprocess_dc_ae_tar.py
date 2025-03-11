@@ -1,6 +1,7 @@
 import os
 import shutil
 import tarfile
+import tempfile
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from diffusers import AutoencoderDC
 import torch
@@ -30,7 +31,6 @@ DELETE_AFTER_PROCESSING = True
 UPLOAD_TO_HUGGINGFACE = True
 UPLOAD_DS_PREFIX = "preprocessed_DCAE-f64_"
 USERNAME = "SwayStar123"
-PARTITIONS = [0,1,2,3,4,5,6,7,8,9]
 
 # with open('prompts.json', 'r') as f:
 #     captions = json.load(f)
@@ -99,67 +99,79 @@ class BucketManager:
 def bytes_to_pil_image(image_bytes):
     return Image.open(io.BytesIO(image_bytes))
 
-def preprocess_image(image, target_size, device='cuda'):
+def preprocess_images_batch(images, target_size, device='cuda'):
     """
-    Merged 'resize_and_crop' + 'preprocess_image' into a single GPU-based pipeline:
-    1) Ensure image is RGB.
-    2) Convert to GPU tensor, normalized to [0,1].
-    3) Resize to preserve aspect ratio (bicubic).
-    4) Random-crop to target_size.
-    5) Normalize channels to [-1, 1].
-    """
-    # Ensure image is in RGB
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
+    Process a batch of images on GPU in one operation:
+    1) Convert PIL images to tensors
+    2) Resize to preserve aspect ratio
+    3) Center crop to target size
+    4) Normalize to [-1, 1]
     
-    # Convert to GPU tensor, [C, H, W], in floating [0,1]
-    img_tensor = torch.as_tensor(np.array(image), device=device).permute(2, 0, 1).float() / 255.0
-    orig_c, orig_h, orig_w = img_tensor.shape
-
-    # Unpack desired width/height
+    Args:
+        images (list): List of PIL images
+        target_size (tuple): Target width and height as (w, h)
+        device (str): Device to process on, default 'cuda'
+        
+    Returns:
+        torch.Tensor: Batch of processed images [B, C, H, W]
+    """
+    # Target dimensions
     target_w, target_h = target_size
-    # Compute aspect ratios
-    aspect_ratio = orig_w / orig_h
+    
+    # Convert all images to RGB first
+    rgb_images = [img.convert('RGB') if img.mode != 'RGB' else img for img in images]
+    
+    # Create a batch of tensors [B, C, H, W]
+    batch = []
+    for img in rgb_images:
+        # Convert to tensor [C, H, W]
+        img_tensor = torch.as_tensor(np.array(img), device=device).permute(2, 0, 1).float() / 255.0
+        batch.append(img_tensor)
+    
+    # Stack into batch
+    batch_tensor = torch.stack(batch)  # [B, C, H, W]
+    
+    # Calculate resize dimensions for each image in batch
+    b, c, h, w = batch_tensor.shape
+    
+    # Calculate aspect ratios
+    aspect_ratios = w / h  # Assuming all images in batch have same shape due to bucketing
     target_aspect_ratio = target_w / target_h
-
+    
     # Decide how to resize
-    if abs(aspect_ratio - target_aspect_ratio) < 1e-6:
+    if abs(aspect_ratios - target_aspect_ratio) < 1e-6:
         # Aspect ratios match, just resize directly
-        new_width, new_height = target_w, target_h
+        new_h, new_w = target_h, target_w
     else:
-        if aspect_ratio > target_aspect_ratio:
-            # Image is wider than target -> match target height
-            new_height = target_h
-            new_width = int(aspect_ratio * new_height)
+        if aspect_ratios > target_aspect_ratio:
+            # Images are wider than target -> match target height
+            new_h = target_h
+            new_w = int(aspect_ratios * new_h)
         else:
-            # Image is taller than target -> match target width
-            new_width = target_w
-            new_height = int(new_width / aspect_ratio)
-
-    # Resize on GPU via interpolate
-    # Need [N,C,H,W], so add batch dimension
-    img_tensor_4d = img_tensor.unsqueeze(0)  # [1, C, H, W]
-    resized_4d = F.interpolate(
-        img_tensor_4d,
-        size=(new_height, new_width),
+            # Images are taller than target -> match target width
+            new_w = target_w
+            new_h = int(new_w / aspect_ratios)
+    
+    # Resize batch using interpolate
+    resized_batch = F.interpolate(
+        batch_tensor,
+        size=(new_h, new_w),
         mode='bicubic',
         align_corners=False
     )
-    # Remove batch dim => [C, H, W]
-    resized = resized_4d.squeeze(0)
-
-    # Random crop to target size
-    # (Assumes new_width >= target_w and new_height >= target_h.)
-    h_off = torch.randint(0, resized.shape[1] - target_h + 1, size=(1,), device=device).item()
-    w_off = torch.randint(0, resized.shape[2] - target_w + 1, size=(1,), device=device).item()
-    cropped = resized[:, h_off:h_off + target_h, w_off:w_off + target_w]
-
-    # Normalize to [-1,1] the same way as:
-    #   transforms.Normalize([0.5,0.5,0.5], [0.5,0.5,0.5])
-    # which is (x - 0.5)/0.5 => 2x - 1
-    cropped = cropped * 2.0 - 1.0
-
-    return cropped  # [C, target_h, target_w], in [-1,1], on GPU
+    
+    # Center crop to target size
+    if new_w > target_w:
+        start_w = (new_w - target_w) // 2
+        resized_batch = resized_batch[:, :, :, start_w:start_w + target_w]
+    if new_h > target_h:
+        start_h = (new_h - target_h) // 2
+        resized_batch = resized_batch[:, :, start_h:start_h + target_h, :]
+    
+    # Normalize to [-1, 1]
+    normalized_batch = resized_batch * 2.0 - 1.0
+    
+    return normalized_batch
 
 @torch.inference_mode()
 @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -219,6 +231,9 @@ def download_and_queue_tars(queue, download_progress, total_files, download_comp
             queue.put(local_file)
             with download_progress.get_lock():
                 download_progress.value += 1
+        else:
+            # If download failed after all retries, fail the program
+            raise Exception(f"Failed to download {file} after maximum retries")
     
     download_complete_event.set()
 
@@ -254,14 +269,17 @@ def upload_worker(upload_queue, upload_complete_event):
                 os.remove(file_path)
         else:
             print(f"Failed to upload: {file_path}")
+            # If upload failed after all retries, raise an exception
+            raise Exception(f"Failed to upload {file_path} after maximum retries")
 
 def extract_and_process_batch(images, image_ids, ae, device, bucket_manager):
-    # Get ideal resolution for first image
+    """Process a batch of images with the same shape."""
+    # Get ideal resolution for this batch
     original_resolution = images[0].size
     new_resolution = bucket_manager.get_ideal_resolution(original_resolution)
     
-    # Resize and preprocess images
-    image_tensors = torch.stack([preprocess_image(img, new_resolution, device) for img in images]).to(device)
+    # Batch process the images
+    image_tensors = preprocess_images_batch(images, new_resolution, device)
     
     # Generate AE latents
     latents = generate_latents(ae, image_tensors).to(torch.float16)
@@ -271,14 +289,6 @@ def extract_and_process_batch(images, image_ids, ae, device, bucket_manager):
     for i in range(len(images)):
         image_id = image_ids[i]
         
-        # Get the three captions from the external JSON file for this image
-        # caption_data = captions.get(image_id, {})
-        # image_captions = [
-        #     caption_data.get("caption_sharecap_short", ""),
-        #     caption_data.get("caption_florence2_short", ""),
-        #     caption_data.get("caption_internlm2_short", "")
-        # ]
-        
         new_row = {
             'image_id': image_id,
             # 'caption': image_captions,
@@ -287,65 +297,68 @@ def extract_and_process_batch(images, image_ids, ae, device, bucket_manager):
         }
         new_rows.append(new_row)
     
-    return new_rows
+    return new_rows, len(images)
 
-def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file):
-    # Extract tar file contents
-    extract_dir = os.path.join(os.path.dirname(tar_filepath), 'extracted_' + os.path.basename(tar_filepath).replace('.tar', ''))
-    os.makedirs(extract_dir, exist_ok=True)
+def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file, total_images=None):
+    # Ensure the base directory exists
+    os.makedirs(DATASET_DIR_BASE, exist_ok=True)
     
-    with tarfile.open(tar_filepath, 'r') as tar:
-        tar.extractall(path=extract_dir)
-    
-    # Find all JPG files and their corresponding JSON files
-    image_files = []
-    json_files = []
-    
-    for root, _, files in os.walk(extract_dir):
-        for file in files:
-            if file.endswith('.jpg'):
-                image_files.append(os.path.join(root, file))
-            elif file.endswith('.json') and not file.startswith('.'):  # Exclude the special PaxHeader files
-                json_files.append(os.path.join(root, file))
-    
-    # Check for valid files
-    if not image_files or not json_files:
-        print(f"No valid files found in {tar_filepath}")
-        if DELETE_AFTER_PROCESSING:
-            shutil.rmtree(extract_dir)
-            os.remove(tar_filepath)
-        return 0
-    
-    # Map JSON files to image files
-    file_pairs = []
-    for img_path in image_files:
-        img_basename = os.path.basename(img_path).split('.')[0]
-        matching_json = None
+    # Use a temporary directory within DATASET_DIR_BASE
+    with tempfile.TemporaryDirectory(dir=DATASET_DIR_BASE) as extract_dir:
+        # Extract tar file contents
+        with tarfile.open(tar_filepath, 'r') as tar:
+            tar.extractall(path=extract_dir)
         
-        for json_path in json_files:
-            json_basename = os.path.basename(json_path).split('.')[0]
-            if json_basename == img_basename:
-                matching_json = json_path
-                break
+        # Find all JPG files and their corresponding JSON files
+        image_files = []
+        json_files = []
         
-        if matching_json:
-            file_pairs.append((img_path, matching_json))
-    
-    if not file_pairs:
-        print(f"No valid file pairs found in {tar_filepath}")
-        if DELETE_AFTER_PROCESSING:
-            shutil.rmtree(extract_dir)
-            os.remove(tar_filepath)
-        return 0
-    
-    # Process images using shape batching
-    shape_batches = defaultdict(lambda: {'images': [], 'image_ids': []})
-    all_rows = []
-    total_processed = 0
-    
-    # First pass: organize images by shape
-    for img_path, json_path in file_pairs:
-        try:
+        for root, _, files in os.walk(extract_dir):
+            for file in files:
+                if file.endswith('.jpg'):
+                    image_files.append(os.path.join(root, file))
+                elif file.endswith('.json') and not file.startswith('.'):  # Exclude the special PaxHeader files
+                    json_files.append(os.path.join(root, file))
+        
+        # Check for valid files
+        if not image_files or not json_files:
+            print(f"No valid files found in {tar_filepath}")
+            if DELETE_AFTER_PROCESSING:
+                os.remove(tar_filepath)
+            return 0
+        
+        # Map JSON files to image files
+        file_pairs = []
+        
+        for img_path in image_files:
+            img_basename = os.path.basename(img_path).split('.')[0]
+            matching_json = None
+            
+            for json_path in json_files:
+                json_basename = os.path.basename(json_path).split('.')[0]
+                if json_basename == img_basename:
+                    matching_json = json_path
+                    break
+            
+            if matching_json:
+                # Verify the JSON has a valid key
+                with open(matching_json, 'r') as f:
+                    metadata = json.load(f)
+                    if metadata.get('key'):
+                        file_pairs.append((img_path, matching_json))
+        
+        if not file_pairs:
+            print(f"No valid file pairs found in {tar_filepath}")
+            if DELETE_AFTER_PROCESSING:
+                os.remove(tar_filepath)
+            return 0
+        
+        # Process images using shape batching
+        shape_batches = defaultdict(lambda: {'images': [], 'image_ids': []})
+        all_rows = []
+        
+        # First pass: organize images by shape
+        for img_path, json_path in file_pairs:
             # Get image ID from JSON
             with open(json_path, 'r') as f:
                 metadata = json.load(f)
@@ -371,61 +384,63 @@ def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tra
                 }
                 
                 # Process batch
-                new_rows = extract_and_process_batch(
+                new_rows, batch_processed = extract_and_process_batch(
                     batch['images'], batch['image_ids'], ae, device, bucket_manager
                 )
                 
                 all_rows.extend(new_rows)
-                total_processed += len(batch['images'])
+                
+                # Update total_images counter in real-time
+                if total_images is not None:
+                    with total_images.get_lock():
+                        total_images.value += batch_processed
                 
                 # Remove processed images from the batch
                 shape_batches[resolution]['images'] = shape_batches[resolution]['images'][BS:]
                 shape_batches[resolution]['image_ids'] = shape_batches[resolution]['image_ids'][BS:]
+        
+        # Process remaining items in shape batches
+        for resolution, batch in shape_batches.items():
+            if len(batch['images']) > 0:
+                # Process batch
+                new_rows, batch_processed = extract_and_process_batch(
+                    batch['images'], batch['image_ids'], ae, device, bucket_manager
+                )
+                
+                all_rows.extend(new_rows)
+                
+                # Update total_images counter in real-time
+                if total_images is not None:
+                    with total_images.get_lock():
+                        total_images.value += batch_processed
+        
+        # Create and save parquet if we have processed rows
+        if all_rows:
+            schema = pa.schema([
+                ('image_id', pa.string()),
+                ('ae_latent', pa.list_(pa.float16())),
+                ('ae_latent_shape', pa.list_(pa.int64())),
+            ])
             
-        except Exception as e:
-            print(f"Error processing image {img_path}: {str(e)}")
-    
-    # Process remaining items in shape batches
-    for resolution, batch in shape_batches.items():
-        if len(batch['images']) > 0:
-            # Process batch
-            new_rows = extract_and_process_batch(
-                batch['images'], batch['image_ids'], ae, device, bucket_manager
-            )
+            new_df = pa.Table.from_pylist(all_rows, schema=schema)
+            new_parquet_dir = os.path.join(DATASET_DIR_BASE, f"{UPLOAD_DS_PREFIX}{DATASET}")
+            os.makedirs(new_parquet_dir, exist_ok=True)
             
-            all_rows.extend(new_rows)
-            total_processed += len(batch['images'])
-    
-    # Create and save parquet if we have processed rows
-    if all_rows:
-        schema = pa.schema([
-            ('image_id', pa.string()),
-            ('caption', pa.list_(pa.string())),
-            ('ae_latent', pa.list_(pa.float16())),
-            ('ae_latent_shape', pa.list_(pa.int64())),
-        ])
+            # Use tar filename to create unique parquet filename
+            tar_base = os.path.basename(tar_filepath).replace('.tar', '')
+            parquet_filename = f"{tar_base}.parquet"
+            new_parquet_path = os.path.join(new_parquet_dir, parquet_filename)
+            pq.write_table(new_df, new_parquet_path)
+            
+            if UPLOAD_TO_HUGGINGFACE:
+                upload_queue.put((new_parquet_path, parquet_filename))
         
-        new_df = pa.Table.from_pylist(all_rows, schema=schema)
-        new_parquet_dir = os.path.join(DATASET_DIR_BASE, f"{UPLOAD_DS_PREFIX}{DATASET}")
-        os.makedirs(new_parquet_dir, exist_ok=True)
+        # Delete the tar file (temp dir is auto-cleaned)
+        if DELETE_AFTER_PROCESSING:
+            os.remove(tar_filepath)
         
-        # Use tar filename to create unique parquet filename
-        tar_base = os.path.basename(tar_filepath).replace('.tar', '')
-        parquet_filename = f"{tar_base}.parquet"
-        new_parquet_path = os.path.join(new_parquet_dir, parquet_filename)
-        pq.write_table(new_df, new_parquet_path)
+        add_processed_file(tracking_file, os.path.basename(tar_filepath))
         
-        if UPLOAD_TO_HUGGINGFACE:
-            upload_queue.put((new_parquet_path, parquet_filename))
-    
-    # Clean up
-    if DELETE_AFTER_PROCESSING:
-        shutil.rmtree(extract_dir)
-        os.remove(tar_filepath)
-    
-    add_processed_file(tracking_file, os.path.basename(tar_filepath))
-    
-    return total_processed
 
 def process_tars(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file, upload_queue):
     # Move CUDA initialization inside this function
@@ -437,22 +452,17 @@ def process_tars(rank, world_size, queue, process_progress, total_files, total_i
     bucket_manager = BucketManager()
     
     while not (download_complete_event.is_set() and queue.empty()):
-        try:
-            tar_filepath = queue.get(timeout=10)
-        except:
-            continue
+        # Get next tar file, but without catching exceptions
+        tar_filepath = queue.get(timeout=10)
 
         if os.path.basename(tar_filepath) in get_processed_files(tracking_file):
             continue
 
         print(f"Processing {os.path.basename(tar_filepath)} on device {device}")
         
-        images_processed = process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file)
+        # Process tar file - no exception handling
+        process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file, total_images)
         
-        # Update total images processed
-        with total_images.get_lock():
-            total_images.value += images_processed
-
         # Update process progress
         with process_progress.get_lock():
             process_progress.value += 1
@@ -493,14 +503,19 @@ def process_dataset():
     
     # Progress bars with img/s estimate
     start_time = time.time()
+    last_update_time = start_time
     with tqdm(total=None, desc="Downloading files", position=1) as download_pbar, \
          tqdm(total=None, desc="Processing files", position=2) as process_pbar:
         last_images = 0
+        rates = []  # Keep track of recent rates for smoothing
+        
         while not (download_complete_event.is_set() and queue.empty()):
             current_download_progress = download_progress.value
             current_process_progress = process_progress.value
             current_images = total_images.value
-            elapsed_time = time.time() - start_time
+            current_time = time.time()
+            elapsed_time = current_time - start_time
+            time_since_last_update = current_time - last_update_time
             
             # Update totals if changed
             if download_pbar.total != total_files.value:
@@ -512,13 +527,47 @@ def process_dataset():
             process_pbar.n = current_process_progress
             
             # Calculate images per second
-            if elapsed_time > 0:
-                img_per_second = current_images / elapsed_time
-                new_images = current_images - last_images
-                if new_images > 0:
-                    img_per_second = (img_per_second + new_images) / 2  # Average of overall and recent speed
+            if time_since_last_update >= 0.5:
+                images_since_last_update = current_images - last_images
+                if images_since_last_update > 0:
+                    current_rate = images_since_last_update / time_since_last_update
+                    
+                    # Add to rates list for smoothing (keep last 5)
+                    rates.append(current_rate)
+                    if len(rates) > 5:
+                        rates.pop(0)
+                    
+                    # Calculate smoothed rate
+                    smoothed_rate = sum(rates) / len(rates)
+                    
+                    # Calculate ETA
+                    if current_process_progress > 0 and total_files.value > 0:
+                        images_per_file = current_images / current_process_progress
+                        remaining_files = total_files.value - current_process_progress
+                        remaining_images = remaining_files * images_per_file
+                        eta_seconds = remaining_images / smoothed_rate if smoothed_rate > 0 else 0
+                        
+                        # Format ETA
+                        if eta_seconds < 60:
+                            eta_str = f"{eta_seconds:.0f}s"
+                        elif eta_seconds < 3600:
+                            eta_str = f"{eta_seconds/60:.1f}m"
+                        else:
+                            eta_str = f"{eta_seconds/3600:.1f}h"
+                        
+                        process_pbar.set_postfix({
+                            'img/s': f'{smoothed_rate:.2f}', 
+                            'ETA': eta_str,
+                            'images': f'{current_images}'
+                        })
+                    else:
+                        process_pbar.set_postfix({
+                            'img/s': f'{smoothed_rate:.2f}',
+                            'images': f'{current_images}'
+                        })
                 
-                process_pbar.set_postfix({'img/s': f'{img_per_second:.2f}'})
+                last_images = current_images
+                last_update_time = current_time
             
             # Pause or resume download based on queue size
             if queue.qsize() > world_size * 2:
@@ -529,8 +578,7 @@ def process_dataset():
             download_pbar.refresh()
             process_pbar.refresh()
             
-            last_images = current_images
-            time.sleep(1)
+            time.sleep(0.2)
     
     download_thread.join()
     for p in processes:
