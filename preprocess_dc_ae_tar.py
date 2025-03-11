@@ -32,9 +32,6 @@ UPLOAD_TO_HUGGINGFACE = True
 UPLOAD_DS_PREFIX = "preprocessed_DCAE-f64_"
 USERNAME = "SwayStar123"
 
-# with open('prompts.json', 'r') as f:
-#     captions = json.load(f)
-
 class BucketManager:
     def __init__(self, max_size=(256,256), divisible=64, min_dim=128, base_res=(256,256), dim_limit=512, debug=False):
         self.max_size = max_size
@@ -272,7 +269,18 @@ def upload_worker(upload_queue, upload_complete_event):
             # If upload failed after all retries, raise an exception
             raise Exception(f"Failed to upload {file_path} after maximum retries")
 
-def extract_and_process_batch(images, image_ids, ae, device, bucket_manager):
+def get_short_captions(url, captions):
+    """Extract short captions for an image URL"""
+    if url in captions:
+        cap_data = captions[url]
+        return [
+            cap_data.get("cap_internlm_short", ""),
+            cap_data.get("cap_florence_short", ""),
+            cap_data.get("cap_sharecap_short", "")
+        ]
+    return ["", "", ""]
+
+def extract_and_process_batch(images, image_ids, image_urls, ae, device, bucket_manager, captions):
     """Process a batch of images with the same shape."""
     # Get ideal resolution for this batch
     original_resolution = images[0].size
@@ -288,10 +296,14 @@ def extract_and_process_batch(images, image_ids, ae, device, bucket_manager):
     new_rows = []
     for i in range(len(images)):
         image_id = image_ids[i]
+        image_url = image_urls[i]
+        
+        # Get short captions from the external JSON file
+        image_captions = get_short_captions(image_url, captions)
         
         new_row = {
             'image_id': image_id,
-            # 'caption': image_captions,
+            'caption': image_captions,
             'ae_latent': latents[i].cpu().numpy().flatten(),
             'ae_latent_shape': latents[i].shape,
         }
@@ -299,7 +311,7 @@ def extract_and_process_batch(images, image_ids, ae, device, bucket_manager):
     
     return new_rows, len(images)
 
-def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file, total_images=None):
+def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file, total_images=None, captions=None):
     # Ensure the base directory exists
     os.makedirs(DATASET_DIR_BASE, exist_ok=True)
     
@@ -341,10 +353,10 @@ def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tra
                     break
             
             if matching_json:
-                # Verify the JSON has a valid key
+                # Verify the JSON has a valid key and url
                 with open(matching_json, 'r') as f:
                     metadata = json.load(f)
-                    if metadata.get('key'):
+                    if metadata.get('key') and metadata.get('url'):
                         file_pairs.append((img_path, matching_json))
         
         if not file_pairs:
@@ -354,17 +366,19 @@ def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tra
             return 0
         
         # Process images using shape batching
-        shape_batches = defaultdict(lambda: {'images': [], 'image_ids': []})
+        shape_batches = defaultdict(lambda: {'images': [], 'image_ids': [], 'image_urls': []})
         all_rows = []
+        total_processed = 0
         
         # First pass: organize images by shape
         for img_path, json_path in file_pairs:
-            # Get image ID from JSON
+            # Get image ID and URL from JSON
             with open(json_path, 'r') as f:
                 metadata = json.load(f)
                 image_id = metadata.get('key')
+                image_url = metadata.get('url')
             
-            if not image_id:
+            if not image_id or not image_url:
                 continue
                 
             img = Image.open(img_path)
@@ -375,20 +389,23 @@ def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tra
             resolution = img.size
             shape_batches[resolution]['images'].append(img)
             shape_batches[resolution]['image_ids'].append(image_id)
+            shape_batches[resolution]['image_urls'].append(image_url)
             
             # If we have enough images of this shape, process them
             if len(shape_batches[resolution]['images']) >= BS:
                 batch = {
                     'images': shape_batches[resolution]['images'][:BS],
-                    'image_ids': shape_batches[resolution]['image_ids'][:BS]
+                    'image_ids': shape_batches[resolution]['image_ids'][:BS],
+                    'image_urls': shape_batches[resolution]['image_urls'][:BS]
                 }
                 
                 # Process batch
                 new_rows, batch_processed = extract_and_process_batch(
-                    batch['images'], batch['image_ids'], ae, device, bucket_manager
+                    batch['images'], batch['image_ids'], batch['image_urls'], ae, device, bucket_manager, captions
                 )
                 
                 all_rows.extend(new_rows)
+                total_processed += batch_processed
                 
                 # Update total_images counter in real-time
                 if total_images is not None:
@@ -398,16 +415,18 @@ def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tra
                 # Remove processed images from the batch
                 shape_batches[resolution]['images'] = shape_batches[resolution]['images'][BS:]
                 shape_batches[resolution]['image_ids'] = shape_batches[resolution]['image_ids'][BS:]
+                shape_batches[resolution]['image_urls'] = shape_batches[resolution]['image_urls'][BS:]
         
         # Process remaining items in shape batches
         for resolution, batch in shape_batches.items():
             if len(batch['images']) > 0:
                 # Process batch
                 new_rows, batch_processed = extract_and_process_batch(
-                    batch['images'], batch['image_ids'], ae, device, bucket_manager
+                    batch['images'], batch['image_ids'], batch['image_urls'], ae, device, bucket_manager, captions
                 )
                 
                 all_rows.extend(new_rows)
+                total_processed += batch_processed
                 
                 # Update total_images counter in real-time
                 if total_images is not None:
@@ -418,6 +437,7 @@ def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tra
         if all_rows:
             schema = pa.schema([
                 ('image_id', pa.string()),
+                ('caption', pa.list_(pa.string())),
                 ('ae_latent', pa.list_(pa.float16())),
                 ('ae_latent_shape', pa.list_(pa.int64())),
             ])
@@ -441,6 +461,7 @@ def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tra
         
         add_processed_file(tracking_file, os.path.basename(tar_filepath))
         
+        return total_processed
 
 def process_tars(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file, upload_queue):
     # Move CUDA initialization inside this function
@@ -451,17 +472,20 @@ def process_tars(rank, world_size, queue, process_progress, total_files, total_i
 
     bucket_manager = BucketManager()
     
+    with open('captions.json', 'r') as f:
+        captions = json.load(f)
+    
     while not (download_complete_event.is_set() and queue.empty()):
-        # Get next tar file, but without catching exceptions
-        tar_filepath = queue.get(timeout=10)
+        try:
+            tar_filepath = queue.get(timeout=10)
+        except:
+            continue
 
         if os.path.basename(tar_filepath) in get_processed_files(tracking_file):
             continue
-
-        print(f"Processing {os.path.basename(tar_filepath)} on device {device}")
         
-        # Process tar file - no exception handling
-        process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file, total_images)
+        # Process tar file
+        images_processed = process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file, total_images, captions)
         
         # Update process progress
         with process_progress.get_lock():
