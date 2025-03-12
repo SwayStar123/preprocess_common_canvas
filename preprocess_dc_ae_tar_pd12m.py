@@ -19,8 +19,8 @@ from collections import defaultdict
 from tqdm import tqdm
 from huggingface_hub import HfFileSystem, hf_hub_download, HfApi
 
-DATASET_OWNER = "drawthingsai"
-DATASET = "megalith-10m"
+DATASET_OWNER = "Spawning"
+DATASET = "pd12m-full"
 DATASET_DIR_BASE = "./datasets"
 MODELS_DIR_BASE = "../../models"
 AE_HF_NAME = "mit-han-lab/dc-ae-f64c128-mix-1.0-diffusers"
