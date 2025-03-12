@@ -372,66 +372,80 @@ def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tra
         
         # First pass: organize images by shape
         for img_path, json_path in file_pairs:
-            # Get image ID and URL from JSON
-            with open(json_path, 'r') as f:
-                metadata = json.load(f)
-                image_id = metadata.get('key')
-                image_url = metadata.get('url')
-            
-            if not image_id or not image_url:
-                continue
+            try:
+                # Get image ID and URL from JSON
+                with open(json_path, 'r') as f:
+                    metadata = json.load(f)
+                    image_id = metadata.get('key')
+                    image_url = metadata.get('url')
                 
-            img = Image.open(img_path)
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
+                if not image_id or not image_url:
+                    continue
+                    
+                # Try to fully load the image to verify it's not corrupted
+                img = Image.open(img_path)
+                img.load()  # This will force PIL to load the entire image and verify it's not truncated
                 
-            # Get resolution bucket
-            resolution = img.size
-            shape_batches[resolution]['images'].append(img)
-            shape_batches[resolution]['image_ids'].append(image_id)
-            shape_batches[resolution]['image_urls'].append(image_url)
-            
-            # If we have enough images of this shape, process them
-            if len(shape_batches[resolution]['images']) >= BS:
-                batch = {
-                    'images': shape_batches[resolution]['images'][:BS],
-                    'image_ids': shape_batches[resolution]['image_ids'][:BS],
-                    'image_urls': shape_batches[resolution]['image_urls'][:BS]
-                }
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                    
+                # Get resolution bucket
+                resolution = img.size
+                shape_batches[resolution]['images'].append(img)
+                shape_batches[resolution]['image_ids'].append(image_id)
+                shape_batches[resolution]['image_urls'].append(image_url)
                 
-                # Process batch
-                new_rows, batch_processed = extract_and_process_batch(
-                    batch['images'], batch['image_ids'], batch['image_urls'], ae, device, bucket_manager, captions
-                )
-                
-                all_rows.extend(new_rows)
-                total_processed += batch_processed
-                
-                # Update total_images counter in real-time
-                if total_images is not None:
-                    with total_images.get_lock():
-                        total_images.value += batch_processed
-                
-                # Remove processed images from the batch
-                shape_batches[resolution]['images'] = shape_batches[resolution]['images'][BS:]
-                shape_batches[resolution]['image_ids'] = shape_batches[resolution]['image_ids'][BS:]
-                shape_batches[resolution]['image_urls'] = shape_batches[resolution]['image_urls'][BS:]
+                # If we have enough images of this shape, process them
+                if len(shape_batches[resolution]['images']) >= BS:
+                    batch = {
+                        'images': shape_batches[resolution]['images'][:BS],
+                        'image_ids': shape_batches[resolution]['image_ids'][:BS],
+                        'image_urls': shape_batches[resolution]['image_urls'][:BS]
+                    }
+                    
+                    try:
+                        # Process batch
+                        new_rows, batch_processed = extract_and_process_batch(
+                            batch['images'], batch['image_ids'], batch['image_urls'], 
+                            ae, device, bucket_manager, captions
+                        )
+                        
+                        all_rows.extend(new_rows)
+                        total_processed += batch_processed
+                        
+                        # Update total_images counter in real-time
+                        if total_images is not None:
+                            with total_images.get_lock():
+                                total_images.value += batch_processed
+                    except Exception as e:
+                        print(f"Error processing batch: {str(e)}")
+                    
+                    # Remove processed images from the batch
+                    shape_batches[resolution]['images'] = shape_batches[resolution]['images'][BS:]
+                    shape_batches[resolution]['image_ids'] = shape_batches[resolution]['image_ids'][BS:]
+                    shape_batches[resolution]['image_urls'] = shape_batches[resolution]['image_urls'][BS:]
+            except Exception as e:
+                print(f"Error processing file {img_path}: {str(e)}")
         
         # Process remaining items in shape batches
         for resolution, batch in shape_batches.items():
             if len(batch['images']) > 0:
-                # Process batch
-                new_rows, batch_processed = extract_and_process_batch(
-                    batch['images'], batch['image_ids'], batch['image_urls'], ae, device, bucket_manager, captions
-                )
-                
-                all_rows.extend(new_rows)
-                total_processed += batch_processed
-                
-                # Update total_images counter in real-time
-                if total_images is not None:
-                    with total_images.get_lock():
-                        total_images.value += batch_processed
+                try:
+                    # Process batch
+                    new_rows, batch_processed = extract_and_process_batch(
+                        batch['images'], batch['image_ids'], batch['image_urls'], 
+                        ae, device, bucket_manager, captions
+                    )
+                    
+                    all_rows.extend(new_rows)
+                    total_processed += batch_processed
+                    
+                    # Update total_images counter in real-time
+                    if total_images is not None:
+                        with total_images.get_lock():
+                            total_images.value += batch_processed
+                except Exception as e:
+                    print(f"Error processing final batch for resolution {resolution}: {str(e)}")
         
         # Create and save parquet if we have processed rows
         if all_rows:
@@ -474,7 +488,7 @@ def process_tars(rank, world_size, queue, process_progress, total_files, total_i
     
     with open('captions.json', 'r') as f:
         captions = json.load(f)
-    
+        
     while not (download_complete_event.is_set() and queue.empty()):
         try:
             tar_filepath = queue.get(timeout=10)
@@ -483,7 +497,7 @@ def process_tars(rank, world_size, queue, process_progress, total_files, total_i
 
         if os.path.basename(tar_filepath) in get_processed_files(tracking_file):
             continue
-        
+
         # Process tar file
         images_processed = process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file, total_images, captions)
         
