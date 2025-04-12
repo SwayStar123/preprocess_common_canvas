@@ -29,18 +29,16 @@ BS = 128
 # Deletes original parquet files after processing
 DELETE_AFTER_PROCESSING = True
 UPLOAD_TO_HUGGINGFACE = True
-UPLOAD_DS_PREFIX = "preprocessed_DCAE-f64_"
+UPLOAD_DS_PREFIX = "preprocessed_DCAE-f64_1024_"
 USERNAME = "SwayStar123"
 PARTITIONS = [0,1,2,3,4,5,6,7,8,9]
+TARGET_RES = 1024
 
 with open('prompts.json', 'r') as f:
     captions = json.load(f)
 
-def get_prng(seed):
-    return np.random.RandomState(seed)
-
 class BucketManager:
-    def __init__(self, max_size=(256,256), divisible=64, min_dim=128, base_res=(256,256), bsz=64, world_size=1, global_rank=0, max_ar_error=4, seed=42, dim_limit=512, debug=False):
+    def __init__(self, max_size=(TARGET_RES,TARGET_RES), divisible=64, min_dim=TARGET_RES//2, base_res=(TARGET_RES,TARGET_RES), dim_limit=TARGET_RES*2, debug=False):
         self.max_size = max_size
         self.f = 8
         self.max_tokens = (max_size[0]/self.f) * (max_size[1]/self.f)
@@ -48,18 +46,6 @@ class BucketManager:
         self.min_dim = min_dim
         self.dim_limit = dim_limit
         self.base_res = base_res
-        self.bsz = bsz
-        self.world_size = world_size
-        self.global_rank = global_rank
-        self.max_ar_error = max_ar_error
-        self.prng = get_prng(seed)
-        epoch_seed = self.prng.tomaxint() % (2**32-1)
-        self.epoch_prng = get_prng(epoch_seed) # separate prng for sharding use for increased thread resilience
-        self.epoch = None
-        self.left_over = None
-        self.batch_total = None
-        self.batch_delivered = None
-
         self.debug = debug
 
         self.gen_buckets()
@@ -308,25 +294,27 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
             
             # Resize images
             images = [bytes_to_pil_image(img.as_py()) for img in batch[IMAGE_COLUMN_NAME]]
-            image_tensors = torch.stack([preprocess_image(img, new_resolution) for img in images]).to(device)
+            images = [image for image in images if (image.size[0] * image.size[1] >= TARGET_RES * TARGET_RES)]
+            if images:
+                image_tensors = torch.stack([preprocess_image(img, new_resolution) for img in images]).to(device)
 
-            # Generate AE latents
-            latents = generate_latents(ae, image_tensors).to(torch.float16)
-            
-            # Add only processed outputs to new rows
-            for i in range(len(batch)):
-                image_id = batch[IMAGE_ID_COLUMN_NAME][i].as_py()
-                new_row = {
-                    'image_id': image_id,
-                    'caption': [batch["blip2_caption"][i], captions[image_id]],
-                    'ae_latent': latents[i].cpu().numpy().flatten(),
-                    'ae_latent_shape': latents[i].shape,
-                }
-                new_rows.append(new_row)
-            
-            # Update total images processed
-            with total_images.get_lock():
-                total_images.value += len(batch)
+                # Generate AE latents
+                latents = generate_latents(ae, image_tensors).to(torch.float16)
+                
+                # Add only processed outputs to new rows
+                for i in range(len(batch)):
+                    image_id = batch[IMAGE_ID_COLUMN_NAME][i].as_py()
+                    new_row = {
+                        'image_id': image_id,
+                        'caption': [batch["blip2_caption"][i], captions[image_id]],
+                        'ae_latent': latents[i].cpu().numpy().flatten(),
+                        'ae_latent_shape': latents[i].shape,
+                    }
+                    new_rows.append(new_row)
+                
+                # Update total images processed
+                with total_images.get_lock():
+                    total_images.value += len(batch)
 
         schema = pa.schema([
             ('image_id', pa.string()),
@@ -334,17 +322,18 @@ def process_parquets(rank, world_size, queue, process_progress, total_files, tot
             ('ae_latent', pa.list_(pa.float16())),
             ('ae_latent_shape', pa.list_(pa.int64())),
         ])
-        
-        # Create new parquet file
-        new_df = pa.Table.from_pylist(new_rows, schema=schema)
-        new_parquet_dir = os.path.join(DATASET_DIR_BASE, f"{UPLOAD_DS_PREFIX}{DATASET}", f"{new_resolution[1]}x{new_resolution[0]}")
-        os.makedirs(new_parquet_dir, exist_ok=True)
-        new_parquet_path = os.path.join(new_parquet_dir, os.path.basename(parquet_filepath))
-        pq.write_table(new_df, new_parquet_path)
 
-        if UPLOAD_TO_HUGGINGFACE:
-            name_in_repo = f"{new_resolution[1]}x{new_resolution[0]}/{os.path.basename(parquet_filepath)}"
-            upload_queue.put((new_parquet_path, name_in_repo))
+        if new_rows:
+            # Create new parquet file
+            new_df = pa.Table.from_pylist(new_rows, schema=schema)
+            new_parquet_dir = os.path.join(DATASET_DIR_BASE, f"{UPLOAD_DS_PREFIX}{DATASET}", f"{new_resolution[1]}x{new_resolution[0]}")
+            os.makedirs(new_parquet_dir, exist_ok=True)
+            new_parquet_path = os.path.join(new_parquet_dir, os.path.basename(parquet_filepath))
+            pq.write_table(new_df, new_parquet_path)
+
+            if UPLOAD_TO_HUGGINGFACE:
+                name_in_repo = f"{new_resolution[1]}x{new_resolution[0]}/{os.path.basename(parquet_filepath)}"
+                upload_queue.put((new_parquet_path, name_in_repo))
 
         add_processed_file(tracking_file, os.path.basename(parquet_filepath))
 

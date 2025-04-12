@@ -10,6 +10,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import numpy as np
 from PIL import Image
+# Disable PIL DecompressionBombWarning
+Image.MAX_IMAGE_PIXELS = None
 import torch.nn.functional as F
 from torch.multiprocessing import Queue, Process, Value, Event, set_start_method
 import threading
@@ -22,18 +24,59 @@ from huggingface_hub import HfFileSystem, hf_hub_download, HfApi
 DATASET_OWNER = "Spawning"
 DATASET = "pd12m-full"
 DATASET_DIR_BASE = "./datasets"
-MODELS_DIR_BASE = "../../models"
+MODELS_DIR_BASE = "./models"
 AE_HF_NAME = "mit-han-lab/dc-ae-f64c128-mix-1.0-diffusers"
 IMAGE_COLUMN_NAME = "jpg"
 IMAGE_ID_COLUMN_NAME = "key"
-BS = 32
+BS = 12
 DELETE_AFTER_PROCESSING = True
 UPLOAD_TO_HUGGINGFACE = True
-UPLOAD_DS_PREFIX = "preprocessed_DCAE-f64_"
+UPLOAD_DS_PREFIX = "preprocessed_DCAE-f64_1024_"
 USERNAME = "SwayStar123"
+# Maximum pixel count allowed before downsampling (16 million pixels ≈ 4000x4000)
+MAX_PIXEL_COUNT = 16_000_000
+TARGET_RES = 1024
+
+BLACKLIST_FILE = "failed_tars.txt"
+
+def get_process_file(rank):
+    """Get the current processing file for this process."""
+    return f"current_processing_{rank}.txt"
+
+def save_current_processing(rank, filename):
+    """Save the currently processing tar file for this process."""
+    process_file = get_process_file(rank)
+    with open(process_file, 'w') as f:
+        f.write(filename)
+
+def clear_current_processing(rank):
+    """Clear the current processing file for this process."""
+    process_file = get_process_file(rank)
+    if os.path.exists(process_file):
+        os.remove(process_file)
+
+def get_current_processing(rank):
+    """Get the currently processing tar file for this process."""
+    process_file = get_process_file(rank)
+    if not os.path.exists(process_file):
+        return None
+    with open(process_file, 'r') as f:
+        return f.read().strip()
+
+def load_blacklist():
+    """Load the list of failed tar files."""
+    if not os.path.exists(BLACKLIST_FILE):
+        return set()
+    with open(BLACKLIST_FILE, 'r') as f:
+        return set(line.strip() for line in f if line.strip())
+
+def add_to_blacklist(tar_file):
+    """Add a tar file to the blacklist."""
+    with open(BLACKLIST_FILE, 'a') as f:
+        f.write(f"{tar_file}\n")
 
 class BucketManager:
-    def __init__(self, max_size=(256,256), divisible=64, min_dim=128, base_res=(256,256), dim_limit=512, debug=False):
+    def __init__(self, max_size=(TARGET_RES,TARGET_RES), divisible=64, min_dim=TARGET_RES//2, base_res=(TARGET_RES,TARGET_RES), dim_limit=TARGET_RES*2, debug=False):
         self.max_size = max_size
         self.f = 8
         self.max_tokens = (max_size[0]/self.f) * (max_size[1]/self.f)
@@ -204,12 +247,12 @@ def download_and_queue_tars(queue, download_progress, total_files, download_comp
     fs = HfFileSystem()
 
     tar_files = fs.glob(f"datasets/{DATASET_OWNER}/{DATASET}/*.tar")
-
+    blacklist = load_blacklist()
     processed_files = get_processed_files(tracking_file)
     processed_files_on_hub = fs.glob(f"datasets/{USERNAME}/{UPLOAD_DS_PREFIX}{DATASET}/data/*.parquet")
     processed_files_on_hub = set(os.path.basename(file).replace('.parquet', '.tar') for file in processed_files_on_hub)
 
-    unprocessed_files = [file for file in tar_files if os.path.basename(file) not in processed_files and os.path.basename(file) not in processed_files_on_hub]
+    unprocessed_files = [file for file in tar_files if os.path.basename(file) not in processed_files and os.path.basename(file) not in processed_files_on_hub and os.path.basename(file) not in blacklist]
 
     total_files.value = len(unprocessed_files)
     
@@ -297,101 +340,215 @@ def extract_and_process_batch(images, image_ids, image_captions, ae, device, buc
     
     return new_rows, len(images)
 
-def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file, total_images=None):
-    # Ensure the base directory exists
-    os.makedirs(DATASET_DIR_BASE, exist_ok=True)
+def safe_load_image(img_path, max_pixel_count=MAX_PIXEL_COUNT, bucket_manager=None):
+    """
+    Safely load an image, downsampling if necessary to avoid CUDA OOM errors.
+    If bucket_manager is provided and image is too large, resize directly to ideal resolution.
     
-    # Use a temporary directory within DATASET_DIR_BASE
-    with tempfile.TemporaryDirectory(dir=DATASET_DIR_BASE) as extract_dir:
-        # Extract tar file contents
-        with tarfile.open(tar_filepath, 'r') as tar:
-            tar.extractall(path=extract_dir)
+    Args:
+        img_path: Path to the image file
+        max_pixel_count: Maximum number of pixels allowed
+        bucket_manager: BucketManager instance to determine ideal resolution
         
-        # Find all JPG files and their corresponding JSON files
-        image_files = []
-        json_files = []
+    Returns:
+        PIL Image object that has been downsampled if necessary
+    """
+    # First get image size without loading the whole thing into memory
+    with Image.open(img_path) as img_info:
+        width, height = img_info.size
+        pixel_count = width * height
         
-        for root, _, files in os.walk(extract_dir):
-            for file in files:
-                if file.endswith('.jpg'):
-                    image_files.append(os.path.join(root, file))
-                elif file.endswith('.json') and not file.startswith('.'):  # Exclude the special PaxHeader files
-                    json_files.append(os.path.join(root, file))
-        
-        # Check for valid files
-        if not image_files or not json_files:
-            print(f"No valid files found in {tar_filepath}")
-            if DELETE_AFTER_PROCESSING:
-                os.remove(tar_filepath)
-            return 0
-        
-        # Map JSON files to image files
-        file_pairs = []
-        
-        for img_path in image_files:
-            img_basename = os.path.basename(img_path).split('.')[0]
-            matching_json = None
-            
-            for json_path in json_files:
-                json_basename = os.path.basename(json_path).split('.')[0]
-                if json_basename == img_basename:
-                    matching_json = json_path
-                    break
-            
-            if matching_json:
-                # Verify the JSON has a valid key
-                with open(matching_json, 'r') as f:
-                    metadata = json.load(f)
-                    if metadata.get('key'):
-                        file_pairs.append((img_path, matching_json))
-        
-        if not file_pairs:
-            print(f"No valid file pairs found in {tar_filepath}")
-            if DELETE_AFTER_PROCESSING:
-                os.remove(tar_filepath)
-            return 0
-        
-        # Process images using shape batching
-        shape_batches = defaultdict(lambda: {'images': [], 'image_ids': [], 'image_captions': []})
-        all_rows = []
-        total_processed = 0
-        
-        # First pass: organize images by shape
-        for img_path, json_path in file_pairs:
-            try:
-                # Get image ID and caption from JSON
-                with open(json_path, 'r') as f:
-                    metadata = json.load(f)
-                    image_id = metadata.get('key')
-                    image_caption = metadata.get('caption', '')  # Get caption directly from JSON
+        # If image is too large and we have a bucket manager
+        if pixel_count > max_pixel_count:
+            if bucket_manager:
+                # Get ideal resolution directly from bucket manager
+                ideal_width, ideal_height = bucket_manager.get_ideal_resolution((width, height))
+                # print(f"CPU resizing large image ({width}x{height} → {ideal_width}x{ideal_height})")
                 
-                if not image_id:
-                    continue
-
-                if image_caption == "":
-                    print(f"Empty caption received for image_id: {image_id}")
-                    
-                # Try to fully load the image to verify it's not corrupted
+                # Reopen and resize directly to ideal resolution
                 img = Image.open(img_path)
-                img.load()  # This will force PIL to load the entire image and verify it's not truncated
+                return img.resize((ideal_width, ideal_height), Image.LANCZOS)
+            else:
+                # Fall back to scaling down if no bucket manager provided
+                scale = (max_pixel_count / pixel_count) ** 0.5
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                # print(f"Downsampling large image ({width}x{height} → {new_width}x{new_height})")
                 
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                    
-                # Get resolution bucket
-                resolution = img.size
-                shape_batches[resolution]['images'].append(img)
-                shape_batches[resolution]['image_ids'].append(image_id)
-                shape_batches[resolution]['image_captions'].append(image_caption)
+                # Reopen and resize
+                img = Image.open(img_path)
+                return img.resize((new_width, new_height), Image.LANCZOS)
+        
+        # If no downsampling needed, just open normally
+        return Image.open(img_path)
+
+def get_device_identifier(device):
+    """Get a unique identifier for the device."""
+    if device == 'cuda':
+        return f"cuda_{torch.cuda.current_device()}"
+    return device.replace(':', '_')
+
+def cleanup_temp_directories(device):
+    """Clean up any leftover temporary directories from previous runs for this device."""
+    try:
+        device_id = get_device_identifier(device)
+        temp_dirs = [d for d in os.listdir(DATASET_DIR_BASE) 
+                    if os.path.isdir(os.path.join(DATASET_DIR_BASE, d)) 
+                    and d.startswith(f'tmp_{device_id}_')]
+        for temp_dir in temp_dirs:
+            try:
+                shutil.rmtree(os.path.join(DATASET_DIR_BASE, temp_dir))
+                print(f"Cleaned up leftover temp directory for {device}: {temp_dir}")
+            except Exception as e:
+                print(f"Failed to clean up temp directory {temp_dir}: {str(e)}")
+    except Exception as e:
+        print(f"Error during temp directory cleanup for {device}: {str(e)}")
+
+def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file, total_images=None, skipped_images=None, rank=None):
+    """Process a single tar file."""
+    try:
+        # Save the current processing file as soon as we start
+        if rank is not None:
+            save_current_processing(rank, os.path.basename(tar_filepath))
+        
+        # Ensure the base directory exists
+        os.makedirs(DATASET_DIR_BASE, exist_ok=True)
+        
+        # Get device identifier
+        device_id = get_device_identifier(device)
+        
+        # Clean up any leftover temp directories from previous runs for this device
+        cleanup_temp_directories(device)
+        
+        # Use a temporary directory with device identifier
+        temp_dir = None
+        try:
+            temp_dir = tempfile.TemporaryDirectory(
+                dir=DATASET_DIR_BASE,
+                prefix=f'tmp_{device_id}_'
+            )
+            extract_dir = temp_dir.name
+            
+            # Extract tar file contents
+            with tarfile.open(tar_filepath, 'r') as tar:
+                tar.extractall(path=extract_dir)
+            
+            # Find all JPG files and their corresponding JSON files
+            image_files = []
+            json_files = []
+            
+            for root, _, files in os.walk(extract_dir):
+                for file in files:
+                    if file.endswith('.jpg'):
+                        image_files.append(os.path.join(root, file))
+                    elif file.endswith('.json') and not file.startswith('.'):  # Exclude the special PaxHeader files
+                        json_files.append(os.path.join(root, file))
+            
+            # Check for valid files
+            if not image_files or not json_files:
+                print(f"No valid files found in {tar_filepath}")
+                if DELETE_AFTER_PROCESSING:
+                    os.remove(tar_filepath)
+                return 0
+            
+            # Map JSON files to image files
+            file_pairs = []
+            
+            for img_path in image_files:
+                img_basename = os.path.basename(img_path).split('.')[0]
+                matching_json = None
                 
-                # If we have enough images of this shape, process them
-                if len(shape_batches[resolution]['images']) >= BS:
-                    batch = {
-                        'images': shape_batches[resolution]['images'][:BS],
-                        'image_ids': shape_batches[resolution]['image_ids'][:BS],
-                        'image_captions': shape_batches[resolution]['image_captions'][:BS]
-                    }
+                for json_path in json_files:
+                    json_basename = os.path.basename(json_path).split('.')[0]
+                    if json_basename == img_basename:
+                        matching_json = json_path
+                        break
+                
+                if matching_json:
+                    # Verify the JSON has a valid key
+                    with open(matching_json, 'r') as f:
+                        metadata = json.load(f)
+                        if metadata.get('key'):
+                            file_pairs.append((img_path, matching_json))
+            
+            if not file_pairs:
+                print(f"No valid file pairs found in {tar_filepath}")
+                if DELETE_AFTER_PROCESSING:
+                    os.remove(tar_filepath)
+                return 0
+            
+            # Process images using shape batching
+            shape_batches = defaultdict(lambda: {'images': [], 'image_ids': [], 'image_captions': []})
+            all_rows = []
+            total_processed = 0
+            
+            # First pass: organize images by shape
+            for img_path, json_path in file_pairs:
+                try:
+                    # Get image ID and caption from JSON
+                    with open(json_path, 'r') as f:
+                        metadata = json.load(f)
+                        image_id = metadata.get('key')
+                        image_caption = metadata.get('caption', '')  # Get caption directly from JSON
                     
+                    if not image_id:
+                        continue
+                        
+                    # Try to safely load the image with automatic downsampling if too large
+                    try:
+                        img = safe_load_image(img_path, bucket_manager=bucket_manager)
+                        
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+                            
+                        # Get resolution bucket
+                        resolution = img.size
+                        if resolution[0] * resolution[1] >= TARGET_RES * TARGET_RES:
+                            shape_batches[resolution]['images'].append(img)
+                            shape_batches[resolution]['image_ids'].append(image_id)
+                            shape_batches[resolution]['image_captions'].append(image_caption)
+                        else:
+                            if skipped_images is not None:
+                                with skipped_images.get_lock():
+                                    skipped_images.value += 1
+                    except Exception as e:
+                        print(f"Error loading image {img_path}: {str(e)}, skipping")
+                    
+                    # If we have enough images of this shape, process them
+                    if len(shape_batches[resolution]['images']) >= BS:
+                        batch = {
+                            'images': shape_batches[resolution]['images'][:BS],
+                            'image_ids': shape_batches[resolution]['image_ids'][:BS],
+                            'image_captions': shape_batches[resolution]['image_captions'][:BS]
+                        }
+                        
+                        try:
+                            # Process batch
+                            new_rows, batch_processed = extract_and_process_batch(
+                                batch['images'], batch['image_ids'], batch['image_captions'], 
+                                ae, device, bucket_manager
+                            )
+                            
+                            all_rows.extend(new_rows)
+                            total_processed += batch_processed
+                            
+                            # Update total_images counter in real-time
+                            if total_images is not None:
+                                with total_images.get_lock():
+                                    total_images.value += batch_processed
+                        except Exception as e:
+                            print(f"Error processing batch: {str(e)}")
+                        
+                        # Remove processed images from the batch
+                        shape_batches[resolution]['images'] = shape_batches[resolution]['images'][BS:]
+                        shape_batches[resolution]['image_ids'] = shape_batches[resolution]['image_ids'][BS:]
+                        shape_batches[resolution]['image_captions'] = shape_batches[resolution]['image_captions'][BS:]
+                except Exception as e:
+                    print(f"Error processing file {img_path}: {str(e)}")
+            
+            # Process remaining items in shape batches
+            for resolution, batch in shape_batches.items():
+                if len(batch['images']) > 0:
                     try:
                         # Process batch
                         new_rows, batch_processed = extract_and_process_batch(
@@ -407,101 +564,132 @@ def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tra
                             with total_images.get_lock():
                                 total_images.value += batch_processed
                     except Exception as e:
-                        print(f"Error processing batch: {str(e)}")
-                    
-                    # Remove processed images from the batch
-                    shape_batches[resolution]['images'] = shape_batches[resolution]['images'][BS:]
-                    shape_batches[resolution]['image_ids'] = shape_batches[resolution]['image_ids'][BS:]
-                    shape_batches[resolution]['image_captions'] = shape_batches[resolution]['image_captions'][BS:]
-            except Exception as e:
-                print(f"Error processing file {img_path}: {str(e)}")
-        
-        # Process remaining items in shape batches
-        for resolution, batch in shape_batches.items():
-            if len(batch['images']) > 0:
+                        print(f"Error processing final batch for resolution {resolution}: {str(e)}")
+            
+            # Create and save parquet if we have processed rows
+            if all_rows:
+                schema = pa.schema([
+                    ('image_id', pa.string()),
+                    ('caption', pa.list_(pa.string())),
+                    ('ae_latent', pa.list_(pa.float16())),
+                    ('ae_latent_shape', pa.list_(pa.int64())),
+                ])
+                
+                new_df = pa.Table.from_pylist(all_rows, schema=schema)
+                new_parquet_dir = os.path.join(DATASET_DIR_BASE, f"{UPLOAD_DS_PREFIX}{DATASET}")
+                os.makedirs(new_parquet_dir, exist_ok=True)
+                
+                # Use tar filename to create unique parquet filename
+                tar_base = os.path.basename(tar_filepath).replace('.tar', '')
+                parquet_filename = f"{tar_base}.parquet"
+                new_parquet_path = os.path.join(new_parquet_dir, parquet_filename)
+                pq.write_table(new_df, new_parquet_path)
+                
+                if UPLOAD_TO_HUGGINGFACE:
+                    upload_queue.put((new_parquet_path, parquet_filename))
+            
+            # Delete the tar file (temp dir is auto-cleaned)
+            if DELETE_AFTER_PROCESSING:
+                os.remove(tar_filepath)
+            
+            add_processed_file(tracking_file, os.path.basename(tar_filepath))
+            
+            if rank is not None:
+                clear_current_processing(rank)
+            
+            return True
+        finally:
+            # Ensure temporary directory is cleaned up
+            if temp_dir:
                 try:
-                    # Process batch
-                    new_rows, batch_processed = extract_and_process_batch(
-                        batch['images'], batch['image_ids'], batch['image_captions'], 
-                        ae, device, bucket_manager
-                    )
-                    
-                    all_rows.extend(new_rows)
-                    total_processed += batch_processed
-                    
-                    # Update total_images counter in real-time
-                    if total_images is not None:
-                        with total_images.get_lock():
-                            total_images.value += batch_processed
+                    temp_dir.cleanup()
                 except Exception as e:
-                    print(f"Error processing final batch for resolution {resolution}: {str(e)}")
+                    print(f"Failed to cleanup temp directory: {str(e)}")
+    except Exception as e:
+        print(f"Failed to process {tar_filepath}: {str(e)}")
+        if rank is not None:
+            add_to_blacklist(os.path.basename(tar_filepath))
+            clear_current_processing(rank)
+        return False
+
+def process_tars(rank, world_size, queue, process_progress, total_files, total_images, skipped_images, download_complete_event, tracking_file, upload_queue):
+    """Process tar files from the queue."""
+    try:
+        torch.cuda.set_device(rank)
+        device = f"cuda:{rank}"
+
+        ae = AutoencoderDC.from_pretrained(f"{AE_HF_NAME}", torch_dtype=torch.float16, cache_dir=f"{MODELS_DIR_BASE}/dc_ae").to(device)
+
+        bucket_manager = BucketManager()
         
-        # Create and save parquet if we have processed rows
-        if all_rows:
-            schema = pa.schema([
-                ('image_id', pa.string()),
-                ('caption', pa.list_(pa.string())),
-                ('ae_latent', pa.list_(pa.float16())),
-                ('ae_latent_shape', pa.list_(pa.int64())),
-            ])
+        # Check if there was a previous crash and add the file to blacklist
+        current_processing = get_current_processing(rank)
+        if current_processing:
+            print(f"Process {rank} found crashed file: {current_processing}")
+            add_to_blacklist(current_processing)
+            clear_current_processing(rank)
             
-            new_df = pa.Table.from_pylist(all_rows, schema=schema)
-            new_parquet_dir = os.path.join(DATASET_DIR_BASE, f"{UPLOAD_DS_PREFIX}{DATASET}")
-            os.makedirs(new_parquet_dir, exist_ok=True)
-            
-            # Use tar filename to create unique parquet filename
-            tar_base = os.path.basename(tar_filepath).replace('.tar', '')
-            parquet_filename = f"{tar_base}.parquet"
-            new_parquet_path = os.path.join(new_parquet_dir, parquet_filename)
-            pq.write_table(new_df, new_parquet_path)
-            
-            if UPLOAD_TO_HUGGINGFACE:
-                upload_queue.put((new_parquet_path, parquet_filename))
+        blacklist = load_blacklist()
         
-        # Delete the tar file (temp dir is auto-cleaned)
-        if DELETE_AFTER_PROCESSING:
-            os.remove(tar_filepath)
-        
-        add_processed_file(tracking_file, os.path.basename(tar_filepath))
-        
-        return total_processed
+        while not (download_complete_event.is_set() and queue.empty()):
+            try:
+                tar_filepath = queue.get(timeout=10)
+            except:
+                continue
 
-def process_tars(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file, upload_queue):
-    # Move CUDA initialization inside this function
-    torch.cuda.set_device(rank)
-    device = f"cuda:{rank}"
+            filename = os.path.basename(tar_filepath)
+            if filename in blacklist:
+                print(f"Process {rank} skipping blacklisted file: {filename}")
+                continue
 
-    ae = AutoencoderDC.from_pretrained(f"{AE_HF_NAME}", torch_dtype=torch.float16, cache_dir=f"{MODELS_DIR_BASE}/dc_ae").to(device)
+            if filename in get_processed_files(tracking_file):
+                continue
 
-    bucket_manager = BucketManager()
-        
-    while not (download_complete_event.is_set() and queue.empty()):
-        try:
-            tar_filepath = queue.get(timeout=10)
-        except:
-            continue
+            # Process tar file
+            try:
+                images_processed = process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file, total_images, skipped_images, rank)
+            except Exception as e:
+                print(f"Failed to process {tar_filepath} due to error: {e}")
+                add_to_blacklist(filename)
+                clear_current_processing(rank)
+                continue
 
-        if os.path.basename(tar_filepath) in get_processed_files(tracking_file):
-            continue
+            # Update process progress
+            with process_progress.get_lock():
+                process_progress.value += 1
+                print(f"Process {rank} processed {tar_filepath} ({process_progress.value}/{total_files})")
 
-        # Process tar file
-        images_processed = process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tracking_file, total_images)
-        
-        # Update process progress
-        with process_progress.get_lock():
-            process_progress.value += 1
+    except Exception as e:
+        print(f"Process {rank} failed with error: {str(e)}")
+        # Add any currently processing file to blacklist if we crash
+        current_processing = get_current_processing(rank)
+        if current_processing:
+            print(f"Process {rank} crashed while processing: {current_processing}")
+            add_to_blacklist(current_processing)
+        clear_current_processing(rank)
+        raise
 
 def process_dataset():
     # Set start method to 'spawn'
     set_start_method('spawn', force=True)
-
+    
+    # Print settings for reference
+    print(f"Processing dataset with the following settings:")
+    print(f"- Max pixel count before downsampling: {MAX_PIXEL_COUNT:,} pixels")
+    print(f"- Batch size: {BS}")
+    print(f"- Delete files after processing: {DELETE_AFTER_PROCESSING}")
+    print(f"- Upload to HuggingFace: {UPLOAD_TO_HUGGINGFACE}")
+    
     world_size = torch.cuda.device_count()
+    print(f"- Using {world_size} GPUs")
+    
     queue = Queue()
     upload_queue = Queue()
     download_progress = Value('i', 0)
     process_progress = Value('i', 0)
     total_files = Value('i', 0)
     total_images = Value('i', 0)
+    skipped_images = Value('i', 0)
     download_complete_event = Event()
     upload_complete_event = Event()
     pause_event = Event()
@@ -519,11 +707,38 @@ def process_dataset():
         upload_thread = threading.Thread(target=upload_worker, args=(upload_queue, upload_complete_event))
         upload_thread.start()
     
-    processes = []
+    # Track active processes and their assigned GPU ranks
+    processes = {}
+    alive_flag = Value('i', 1)  # Shared flag to stop monitoring when we're done
+    
+    # Function to monitor and respawn dead processes
+    def monitor_and_respawn():
+        while alive_flag.value:
+            # Check if any processes have died
+            for rank, process in list(processes.items()):
+                if not process.is_alive():
+                    print(f"Process for GPU {rank} died, respawning...")
+                    # Remove the dead process
+                    processes.pop(rank)
+                    # Create a new process for this GPU
+                    p = Process(target=process_tars, args=(rank, world_size, queue, process_progress, total_files, total_images, skipped_images, download_complete_event, tracking_file, upload_queue))
+                    p.start()
+                    processes[rank] = p
+                    print(f"Respawned process for GPU {rank}")
+            
+            # Check every 10 seconds
+            time.sleep(10)
+    
+    # Start the monitoring thread
+    monitor_thread = threading.Thread(target=monitor_and_respawn)
+    monitor_thread.daemon = True  # Daemon thread will exit when main thread exits
+    monitor_thread.start()
+    
+    # Start initial processes
     for rank in range(world_size):
-        p = Process(target=process_tars, args=(rank, world_size, queue, process_progress, total_files, total_images, download_complete_event, tracking_file, upload_queue))
+        p = Process(target=process_tars, args=(rank, world_size, queue, process_progress, total_files, total_images, skipped_images, download_complete_event, tracking_file, upload_queue))
         p.start()
-        processes.append(p)
+        processes[rank] = p
     
     # Progress bars with img/s estimate
     start_time = time.time()
@@ -579,22 +794,30 @@ def process_dataset():
                         else:
                             eta_str = f"{eta_seconds/3600:.1f}h"
                         
+                        # Also include alive processes count
+                        alive_count = sum(1 for p in list(processes.values()) if p.is_alive())
+                        
                         process_pbar.set_postfix({
                             'img/s': f'{smoothed_rate:.2f}', 
                             'ETA': eta_str,
-                            'images': f'{current_images}'
+                            'images': f'{current_images}',
+                            'skipped': f'{skipped_images.value}',
+                            'GPUs': f'{alive_count}/{world_size}'
                         })
                     else:
+                        alive_count = sum(1 for p in list(processes.values()) if p.is_alive())
                         process_pbar.set_postfix({
                             'img/s': f'{smoothed_rate:.2f}',
-                            'images': f'{current_images}'
+                            'images': f'{current_images}',
+                            'skipped': f'{skipped_images.value}',
+                            'GPUs': f'{alive_count}/{world_size}'
                         })
                 
                 last_images = current_images
                 last_update_time = current_time
             
             # Pause or resume download based on queue size
-            if queue.qsize() > world_size * 2:
+            if queue.qsize() >= world_size:
                 pause_event.clear()  # Pause download
             else:
                 pause_event.set()  # Resume download
@@ -604,13 +827,23 @@ def process_dataset():
             
             time.sleep(0.2)
     
+    # Signal monitoring thread to stop
+    alive_flag.value = 0
+    
+    # Wait for download thread to finish
     download_thread.join()
-    for p in processes:
-        p.join()
+    
+    # Terminate all worker processes
+    for p in processes.values():
+        if p.is_alive():
+            p.terminate()
+            p.join()
 
     if UPLOAD_TO_HUGGINGFACE:
         upload_complete_event.set()
         upload_thread.join()
+    
+    print("Processing complete!")
 
 if __name__ == "__main__":
     process_dataset()

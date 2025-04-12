@@ -9,4 +9,3 @@ hf_transfer
 einops
 accelerate
 nvitop
-accelerate

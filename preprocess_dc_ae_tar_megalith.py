@@ -29,11 +29,12 @@ IMAGE_ID_COLUMN_NAME = "key"
 BS = 32
 DELETE_AFTER_PROCESSING = True
 UPLOAD_TO_HUGGINGFACE = True
-UPLOAD_DS_PREFIX = "preprocessed_DCAE-f64_"
+UPLOAD_DS_PREFIX = "preprocessed_DCAE-f64_1024_"
 USERNAME = "SwayStar123"
+TARGET_RES = 1024
 
 class BucketManager:
-    def __init__(self, max_size=(256,256), divisible=64, min_dim=128, base_res=(256,256), dim_limit=512, debug=False):
+    def __init__(self, max_size=(TARGET_RES,TARGET_RES), divisible=64, min_dim=TARGET_RES//2, base_res=(TARGET_RES,TARGET_RES), dim_limit=TARGET_RES*2, debug=False):
         self.max_size = max_size
         self.f = 8
         self.max_tokens = (max_size[0]/self.f) * (max_size[1]/self.f)
@@ -391,9 +392,10 @@ def process_tar_file(tar_filepath, ae, device, bucket_manager, upload_queue, tra
                     
                 # Get resolution bucket
                 resolution = img.size
-                shape_batches[resolution]['images'].append(img)
-                shape_batches[resolution]['image_ids'].append(image_id)
-                shape_batches[resolution]['image_urls'].append(image_url)
+                if resolution[0] * resolution[1] >= TARGET_RES * TARGET_RES:
+                    shape_batches[resolution]['images'].append(img)
+                    shape_batches[resolution]['image_ids'].append(image_id)
+                    shape_batches[resolution]['image_urls'].append(image_url)
                 
                 # If we have enough images of this shape, process them
                 if len(shape_batches[resolution]['images']) >= BS:
